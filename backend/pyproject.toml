@@ -1,0 +1,36 @@
+[project]
+name = "voice-agent-v0-backend"
+version = "0.1.0"
+description = "Multilingual AI voice receptionist V0 -- backend (FastAPI + LiveKit Agents)"
+requires-python = ">=3.11"
+dependencies = [
+    "livekit-agents>=1.8.1,<2",
+    "livekit-plugins-sarvam>=1.8.1,<2",
+    "livekit-plugins-openai>=1.8.1,<2",
+    "livekit-plugins-silero>=1.8.1,<2",
+    "fastapi>=0.141,<1",
+    "uvicorn[standard]>=0.53,<1",
+    "sqlalchemy>=2.0,<3",
+    "pydantic>=2.13,<3",
+    "pydantic-settings>=2.15,<3",
+    "python-dotenv>=1.2,<2",
+    "openai>=2.54,<3",
+    "httpx>=0.28,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1,<10",
+    "pytest-asyncio>=1.4,<2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["app"]

@@ -1,0 +1,32 @@
+# Secrets
+.env
+.env.local
+*.env.local
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+backend/.pytest_cache/
+
+# Data / logs (SQLite db + agent logs; fine to lose locally, never commit)
+backend/data/
+backend/logs/
+*.db
+*.db-journal
+
+# Node / frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/tsconfig.tsbuildinfo
+npm-debug.log*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
