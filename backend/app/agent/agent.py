@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import AsyncIterable
 
 from dotenv import load_dotenv
 
@@ -33,9 +34,11 @@ load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 from livekit.agents import (  # noqa: E402
     Agent,
     AgentSession,
+    APIStatusError,
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
+    ModelSettings,
     RunContext,
     WorkerOptions,
     cli,
@@ -43,6 +46,7 @@ from livekit.agents import (  # noqa: E402
     llm,
     room_io,
 )
+from livekit import rtc  # noqa: E402
 from livekit.plugins import sarvam, silero  # noqa: E402
 
 # All three of these are set to the SAME rate (16kHz) on purpose: it's the
@@ -103,6 +107,25 @@ class Assistant(Agent):
                     signal.ratio,
                     text,
                 )
+
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        # Sarvam Bulbul rejects a segment outright (APIStatusError, "Text must
+        # contain at least one character from the allowed languages") when a
+        # reply is 100% English under target_language_code=hi-IN. The system
+        # prompt now tells the LLM to never do that, but if it ever slips
+        # through anyway, fail loud-in-the-log-but-quiet-to-the-caller instead
+        # of an unhandled task exception -- better than a caller hearing
+        # nothing with no trace of why in the logs.
+        try:
+            async for frame in Agent.default.tts_node(self, text, model_settings):
+                yield frame
+        except APIStatusError:
+            logger.exception(
+                "[call %s] TTS synthesis failed; this turn will not be spoken",
+                self.session.userdata.call_id,
+            )
 
     @function_tool()
     async def check_availability(
@@ -234,6 +257,7 @@ async def entrypoint(ctx: JobContext) -> None:
             target_language_code=settings.sarvam_tts_language,
             speaker=settings.sarvam_tts_speaker,
             speech_sample_rate=AUDIO_SAMPLE_RATE_OUT,
+            dict_id=settings.sarvam_tts_dict_id,
         ),
         vad=ctx.proc.userdata["vad"],
         turn_detection="vad",

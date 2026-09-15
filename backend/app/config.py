@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     sarvam_stt_language: str = Field(default="hi-IN", alias="SARVAM_STT_LANGUAGE")
     sarvam_tts_language: str = Field(default="hi-IN", alias="SARVAM_TTS_LANGUAGE")
     sarvam_tts_speaker: str = Field(default="pooja", alias="SARVAM_TTS_SPEAKER")
+    # Optional: id of a Sarvam pronunciation dictionary (docs.sarvam.ai ->
+    # Text-to-Speech -> Pronunciation Dictionary) used to pin how specific
+    # words/phrases are spoken (e.g. fixing "I am" -> "im"). Unset by default;
+    # bulbul:v3 synthesizes normally without one.
+    sarvam_tts_dict_id: str | None = Field(default=None, alias="SARVAM_TTS_DICT_ID")
     # Used only when LLM_PROVIDER=sarvam -- reuses SARVAM_API_KEY, no separate credential.
     sarvam_llm_model: str = Field(default="sarvam-105b", alias="SARVAM_LLM_MODEL")
 
