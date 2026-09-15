@@ -53,12 +53,18 @@ class Settings(BaseSettings):
     sarvam_llm_model: str = Field(default="sarvam-105b", alias="SARVAM_LLM_MODEL")
 
     # --- LLM provider abstraction ---
-    # "openai" (needs OPENAI_API_KEY + billing) or "sarvam" (reuses SARVAM_API_KEY,
-    # zero extra signup -- see app/llm/provider.py:SarvamLLMProvider).
+    # "openai" (needs OPENAI_API_KEY + billing), "sarvam" (reuses SARVAM_API_KEY,
+    # but its Chat Completions API is beta-gated per-account), or "groq" (free
+    # tier, needs GROQ_API_KEY from console.groq.com). See app/llm/provider.py.
     llm_provider: str = Field(default="openai", alias="LLM_PROVIDER")
     openai_api_key: str = Field(default="YOUR_OPENAI_API_KEY", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
     openai_extraction_model: str = Field(default="gpt-4o-mini", alias="OPENAI_EXTRACTION_MODEL")
+    groq_api_key: str = Field(default="YOUR_GROQ_API_KEY", alias="GROQ_API_KEY")
+    # Groq's exact model lineup varies by account/region -- if this 404s,
+    # run `GET https://api.groq.com/openai/v1/models` with your own key to
+    # see what's actually available and update this.
+    groq_model: str = Field(default="openai/gpt-oss-20b", alias="GROQ_MODEL")
 
     # --- Storage ---
     database_url: str = Field(default="sqlite:///./data/voice_agent.db", alias="DATABASE_URL")
@@ -100,6 +106,8 @@ class Settings(BaseSettings):
         }
         if self.llm_provider == "openai":
             checks["OPENAI_API_KEY"] = self.openai_api_key
+        elif self.llm_provider == "groq":
+            checks["GROQ_API_KEY"] = self.groq_api_key
 
         for name, value in checks.items():
             if value in _PLACEHOLDER_MARKERS or value.startswith("YOUR_"):
