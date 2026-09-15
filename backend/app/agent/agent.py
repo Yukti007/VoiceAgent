@@ -40,8 +40,25 @@ from livekit.agents import (  # noqa: E402
     WorkerOptions,
     cli,
     function_tool,
+    room_io,
 )
 from livekit.plugins import sarvam, silero  # noqa: E402
+
+# All three of these are set to the SAME rate (16kHz) on purpose: it's the
+# rate Sarvam's realtime STT and Silero VAD both require natively. If the
+# room negotiates a different input rate, livekit-rtc's native resampler
+# (libsoxr) has to run on every audio frame -- and on Windows this project
+# has hit a native crash in that resampler (a Visual C++ assertion inside
+# livekit_ffi.dll / soxr's FFT cache, "LSX_FFT_BR == NULL", most likely a
+# known libsoxr thread-safety bug when multiple resamplers are created
+# concurrently). Matching rates end-to-end means the resampler is never
+# invoked on the input leg at all, which avoids the crash entirely rather
+# than working around it after the fact.
+AUDIO_SAMPLE_RATE_IN = 16000
+# Output side: Bulbul TTS can synthesize directly at 24kHz, which is also
+# AgentSession's own default room-output rate -- so, same idea, no resample
+# needed on the way out either.
+AUDIO_SAMPLE_RATE_OUT = 24000
 
 from app.agent import session as call_session  # noqa: E402
 from app.agent.prompts import build_system_prompt  # noqa: E402
@@ -153,7 +170,8 @@ class Assistant(Agent):
 def prewarm(proc: JobProcess) -> None:
     # Loading the (local, ONNX) Silero VAD model is the one meaningfully slow
     # step, so it happens once per worker process instead of once per call.
-    proc.userdata["vad"] = silero.VAD.load()
+    # sample_rate matches AUDIO_SAMPLE_RATE_IN -- see the comment above it.
+    proc.userdata["vad"] = silero.VAD.load(sample_rate=AUDIO_SAMPLE_RATE_IN)
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -183,12 +201,14 @@ async def entrypoint(ctx: JobContext) -> None:
             api_key=settings.sarvam_api_key,
             language=settings.sarvam_stt_language,
             mode="codemix",  # Hindi/English code-switching, e.g. Hinglish
+            sample_rate=AUDIO_SAMPLE_RATE_IN,
         ),
         llm=llm_provider.get_agent_llm(),
         tts=sarvam.TTS(
             api_key=settings.sarvam_api_key,
             target_language_code=settings.sarvam_tts_language,
             speaker=settings.sarvam_tts_speaker,
+            speech_sample_rate=AUDIO_SAMPLE_RATE_OUT,
         ),
         vad=ctx.proc.userdata["vad"],
         turn_detection="vad",
@@ -261,7 +281,12 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_on_shutdown)
 
-    await session.start(agent=Assistant(instructions=instructions), room=ctx.room)
+    await session.start(
+        agent=Assistant(instructions=instructions),
+        room=ctx.room,
+        room_input_options=room_io.RoomInputOptions(audio_sample_rate=AUDIO_SAMPLE_RATE_IN),
+        room_output_options=room_io.RoomOutputOptions(audio_sample_rate=AUDIO_SAMPLE_RATE_OUT),
+    )
     await session.generate_reply(
         instructions=f'Greet the caller now. Say almost exactly: "{greeting}"'
     )
