@@ -123,7 +123,19 @@ export default function Home() {
       roomNameRef.current = tokenRes.room_name;
       appendLog(`Token received. room=${tokenRes.room_name} identity=${tokenRes.identity}`);
 
-      const room = new Room({ adaptiveStream: true, dynacast: true });
+      const room = new Room({
+        adaptiveStream: true,
+        dynacast: true,
+        // Explicit instead of relying on browser/WebRTC defaults: boosts quiet
+        // speech (autoGainControl) and suppresses room noise/echo of Aisha's
+        // own TTS bleeding back into the mic, both of which can otherwise
+        // trigger Sarvam STT's server-side VAD on non-speech audio.
+        audioCaptureDefaults: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       roomRef.current = room;
 
       room.on(RoomEvent.Connected, () => appendLog("Connected to LiveKit room"));
