@@ -49,8 +49,12 @@ class Settings(BaseSettings):
     sarvam_stt_language: str = Field(default="hi-IN", alias="SARVAM_STT_LANGUAGE")
     sarvam_tts_language: str = Field(default="hi-IN", alias="SARVAM_TTS_LANGUAGE")
     sarvam_tts_speaker: str = Field(default="pooja", alias="SARVAM_TTS_SPEAKER")
+    # Used only when LLM_PROVIDER=sarvam -- reuses SARVAM_API_KEY, no separate credential.
+    sarvam_llm_model: str = Field(default="sarvam-105b", alias="SARVAM_LLM_MODEL")
 
     # --- LLM provider abstraction ---
+    # "openai" (needs OPENAI_API_KEY + billing) or "sarvam" (reuses SARVAM_API_KEY,
+    # zero extra signup -- see app/llm/provider.py:SarvamLLMProvider).
     llm_provider: str = Field(default="openai", alias="LLM_PROVIDER")
     openai_api_key: str = Field(default="YOUR_OPENAI_API_KEY", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
