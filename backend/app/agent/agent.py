@@ -40,6 +40,7 @@ from livekit.agents import (  # noqa: E402
     WorkerOptions,
     cli,
     function_tool,
+    llm,
     room_io,
 )
 from livekit.plugins import sarvam, silero  # noqa: E402
@@ -63,6 +64,7 @@ AUDIO_SAMPLE_RATE_OUT = 24000
 from app.agent import session as call_session  # noqa: E402
 from app.agent.prompts import build_system_prompt  # noqa: E402
 from app.agent.state import SessionData  # noqa: E402
+from app.agent.stt_guard import detect_repetition  # noqa: E402
 from app.business.service import DatabaseKnowledgeProvider  # noqa: E402
 from app.llm.provider import get_llm_provider  # noqa: E402
 from app.postcall.extractor import run_post_call_extraction  # noqa: E402
@@ -78,6 +80,29 @@ class Assistant(Agent):
 
     def __init__(self, *, instructions: str) -> None:
         super().__init__(instructions=instructions)
+
+    async def on_user_turn_completed(
+        self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
+    ) -> None:
+        # Log-only guard for a known Sarvam Saaras STT failure mode (repeats one
+        # word dozens of times on some short/quiet audio instead of transcribing
+        # real speech). Not yet discarding/reprompting on this -- see
+        # app/agent/stt_guard.py for why. The transcript still goes to the LLM
+        # unchanged; this just gives visibility into how often it actually fires.
+        text = new_message.text_content
+        if text:
+            signal = detect_repetition(text)
+            if signal:
+                logger.warning(
+                    "[call %s] possible STT hallucination: token=%r count=%d/%d "
+                    "(ratio=%.2f) transcript=%r",
+                    self.session.userdata.call_id,
+                    signal.token,
+                    signal.count,
+                    signal.total_tokens,
+                    signal.ratio,
+                    text,
+                )
 
     @function_tool()
     async def check_availability(
