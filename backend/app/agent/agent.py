@@ -12,12 +12,21 @@ Run with:
 from __future__ import annotations
 
 import logging
+import sys
 
 from dotenv import load_dotenv
 
 from app.config import PROJECT_ROOT, ensure_dirs, get_settings
 from app.database.database import init_db, session_scope
 from app.database.models import Business
+
+# Windows' console defaults to the system codepage (e.g. cp1252), which can't
+# encode Devanagari/Hindi transcript text and other non-ASCII output -- this
+# demo is specifically about Hindi/Hinglish, so force UTF-8 stdout/stderr
+# instead of silently corrupting/dropping log lines with Unicode in them.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 

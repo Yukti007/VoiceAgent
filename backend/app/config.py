@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     sarvam_api_key: str = Field(default="YOUR_SARVAM_API_KEY", alias="SARVAM_API_KEY")
     sarvam_stt_language: str = Field(default="hi-IN", alias="SARVAM_STT_LANGUAGE")
     sarvam_tts_language: str = Field(default="hi-IN", alias="SARVAM_TTS_LANGUAGE")
-    sarvam_tts_speaker: str = Field(default="anushka", alias="SARVAM_TTS_SPEAKER")
+    sarvam_tts_speaker: str = Field(default="pooja", alias="SARVAM_TTS_SPEAKER")
 
     # --- LLM provider abstraction ---
     llm_provider: str = Field(default="openai", alias="LLM_PROVIDER")

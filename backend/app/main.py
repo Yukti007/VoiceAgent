@@ -9,6 +9,7 @@ Run with:
 from __future__ import annotations
 
 import logging
+import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +19,12 @@ from app.config import ensure_dirs, get_settings
 from app.database.database import init_db
 
 settings = get_settings()
+
+# Force UTF-8 stdout/stderr on Windows (default console codepage can't encode
+# Hindi/Devanagari text that may show up in logs, e.g. via call summaries).
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
