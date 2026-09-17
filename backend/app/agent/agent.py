@@ -11,6 +11,7 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 
@@ -173,6 +174,22 @@ def prewarm(proc: JobProcess) -> None:
     # sample_rate matches AUDIO_SAMPLE_RATE_IN -- see the comment above it.
     proc.userdata["vad"] = silero.VAD.load(sample_rate=AUDIO_SAMPLE_RATE_IN)
 
+    # Two lazy-import stalls measured live, both moved here so they land during
+    # process warm-up instead of during a real call's first turn:
+    # 1. livekit-plugins-openai's LLM (used for BOTH the "openai" and "groq"
+    #    providers -- see app/llm/provider.py, Groq just points the same
+    #    plugin at a different base_url) prewarms itself via client.models.list(),
+    #    which on first use imports openai's `resources.beta.chatkit` submodule
+    #    tree -- measured at ~2.9s blocking the asyncio event loop.
+    # 2. Constructing any AsyncOpenAI client (e.g. GroqProvider's own client for
+    #    post-call extraction, in get_llm_provider() below) imports httpcore's
+    #    sync backend the first time -- measured at ~0.5s.
+    # Both block audio/turn handling for their whole duration wherever they land;
+    # importing them up front makes that a one-time per-process cost instead of
+    # a per-call one.
+    import httpcore  # noqa: F401
+    import openai.resources.beta.chatkit.chatkit  # noqa: F401
+
 
 async def entrypoint(ctx: JobContext) -> None:
     ensure_dirs()
@@ -190,7 +207,14 @@ async def entrypoint(ctx: JobContext) -> None:
         greeting = business.greeting
         agent_name = business.agent_name
 
-    call_id = call_session.create_call(business_id, room_name=ctx.room.name)
+    # create_call/add_call_message/end_call each run a synchronous SQLAlchemy
+    # commit -- measured live (agent_worker_verify.log) at 130-570ms apiece,
+    # which blocks this same asyncio loop that also handles audio and turn
+    # detection ("event loop blocked" warnings from livekit-agents pointed
+    # straight at sqlalchemy's do_commit). Running them in a worker thread
+    # keeps the DB write off the realtime path instead of just moving where
+    # in the call it stalls.
+    call_id = await asyncio.to_thread(call_session.create_call, business_id, room_name=ctx.room.name)
     logger.info("[call %s] starting session for room=%s agent=%s", call_id, ctx.room.name, agent_name)
 
     llm_provider = get_llm_provider(settings)
@@ -199,8 +223,31 @@ async def entrypoint(ctx: JobContext) -> None:
         userdata=SessionData(business_id=business_id, call_id=call_id, room_name=ctx.room.name),
         stt=sarvam.STTRealtime(
             api_key=settings.sarvam_api_key,
+            # `language` was previously pinned to a fixed BCP-47 code (hi-IN), which
+            # doesn't just set a *default* -- it forces Sarvam to decode every
+            # utterance through that language's model. A pinned "hi-IN" was
+            # confirmed live to mis-transcribe/drop words in English speech (being
+            # decoded through a Hindi acoustic/language model) and to report every
+            # utterance's language as "hi" regardless of what was actually said --
+            # which then fed a Hindi (or garbled) transcript to the LLM, whose
+            # "reply in the caller's language" instruction faithfully mirrored that
+            # mistake back in Hindi even when the caller spoke English. `"auto"` is
+            # a first-class value here (see livekit-plugins-sarvam's
+            # RealtimeSTTOptions.language / SUPPORTED_LANGUAGES) that runs Sarvam's
+            # own per-utterance language identification instead, so English and
+            # Hindi/Hinglish speech are each decoded through their own model and
+            # `ev.language` on user_input_transcribed reports what was actually
+            # detected -- which is also what the TTS-retargeting handler below
+            # already relies on.
             language=settings.sarvam_stt_language,
-            mode="codemix",  # Hindi/English code-switching, e.g. Hinglish
+            # "codemix" was separately confirmed to render pure-English utterances
+            # as Devanagari-script phonetic transliteration (e.g. "Hi Aisha, how are
+            # you?" -> "हाय आयशा, हाउ आर यू?") even independent of the language-pin
+            # issue above. "transcribe" is standard transcription in the language
+            # actually spoken/detected, which is what we want; "codemix" is for
+            # genuinely mixed Hindi/English *within one utterance*, not a wholesale
+            # script choice.
+            mode="transcribe",
             sample_rate=AUDIO_SAMPLE_RATE_IN,
         ),
         llm=llm_provider.get_agent_llm(),
@@ -210,17 +257,72 @@ async def entrypoint(ctx: JobContext) -> None:
             speaker=settings.sarvam_tts_speaker,
             speech_sample_rate=AUDIO_SAMPLE_RATE_OUT,
         ),
+        # `vad` still gates raw speech/silence framing (and is required by the STT/TTS
+        # provider interfaces below), but deliberately NOT passed as `turn_detection`:
+        # livekit-agents 1.8's default turn detector is a semantic end-of-turn model
+        # (inference.TurnDetector, per-language thresholds incl. "hi") that judges
+        # whether a pause is really turn-final instead of just timing raw silence.
+        # Forcing turn_detection="vad" (the previous config) disables that model and
+        # falls back to a fixed silence timeout -- worse latency on confident turn
+        # ends AND more false interruptions on mid-sentence pauses, which are exactly
+        # this demo's two headline risks for Hindi/Hinglish speech. Leaving
+        # `turn_detection` unset lets AgentSession pick that smart default.
         vad=ctx.proc.userdata["vad"],
-        turn_detection="vad",
-        allow_interruptions=True,
+        # Interruption handling: the framework's default "adaptive" mode (ML-based,
+        # tolerates likely backchannel like "haan"/"hmm" near the start of a turn so
+        # it doesn't cut the agent off for those) let a real test caller's barge-in
+        # go unrecognized -- their speech reached the transcript but Aisha kept
+        # talking to the end of her sentence anyway, because the classifier scored
+        # it below its interruption threshold. Switching to "vad" mode makes ANY
+        # sustained user speech stop Aisha immediately, no semantic judgment call --
+        # matches "the instant the customer starts speaking, pause and listen."
+        # Trade-off: short backchannel utterances will now interrupt her too, since
+        # vad mode can't distinguish them from real barge-in the way adaptive does.
+        turn_handling={"interruption": {"mode": "vad", "min_duration": 0.3}},
     )
 
     # ---- Debug/demo logging: transcript, tool calls, latency metrics, turns ----
+
+    # Bulbul's target_language_code is set once at TTS construction (hi-IN, above)
+    # but the caller's actual language varies turn by turn -- a real test call
+    # showed Bulbul mispronouncing plain English words ("I'm" -> "Im", "Wednesday")
+    # when synthesizing an English reply under a Hindi target. Sarvam's realtime STT
+    # reports a detected `language` per final transcript (already logged below);
+    # retarget the TTS to match it before the next reply is generated, using
+    # sarvam.TTS.update_options (a real runtime API, not a full reconnect). Only
+    # "en" and "hi" are mapped since that's this demo's supported range -- anything
+    # else (misdetection, silence) is left on whatever language is already active
+    # rather than guessed at.
+    _stt_lang_to_tts_target = {"en": "en-IN", "hi": "hi-IN"}
+    _last_tts_target = {"value": settings.sarvam_tts_language}
+
+    def _persist_call_message_async(role: str, text: str) -> None:
+        """conversation_item_added fires on every turn and must stay a plain
+        sync callback (it's invoked directly by livekit.rtc's event emitter),
+        so the DB commit is offloaded to a worker thread and fire-and-forgotten
+        rather than awaited -- see the create_call comment above for why a
+        commit on this loop is expensive."""
+
+        task = asyncio.create_task(
+            asyncio.to_thread(call_session.add_call_message, call_id, role=role, text=text)
+        )
+
+        def _log_if_failed(t: asyncio.Task) -> None:
+            exc = t.exception()
+            if exc:
+                logger.error("[call %s] failed to persist %s message: %s", call_id, role, exc)
+
+        task.add_done_callback(_log_if_failed)
 
     @session.on("user_input_transcribed")
     def _on_user_transcribed(ev) -> None:
         if ev.is_final:
             logger.info("[call %s] STT final: %r (lang=%s)", call_id, ev.transcript, ev.language)
+            target = ev.language and _stt_lang_to_tts_target.get(ev.language.language)
+            if target and target != _last_tts_target["value"]:
+                _last_tts_target["value"] = target
+                session.tts.update_options(target_language_code=target)
+                logger.info("[call %s] TTS target_language_code -> %s", call_id, target)
 
     @session.on("conversation_item_added")
     def _on_item_added(ev) -> None:
@@ -228,7 +330,7 @@ async def entrypoint(ctx: JobContext) -> None:
         role = getattr(item, "role", None)
         text = getattr(item, "text_content", None)
         if role in ("user", "assistant") and text:
-            call_session.add_call_message(call_id, role=role, text=text)
+            _persist_call_message_async(role, text)
             logger.info("[call %s] %s: %s", call_id, role, text)
 
     @session.on("metrics_collected")
@@ -273,7 +375,7 @@ async def entrypoint(ctx: JobContext) -> None:
         call_status["value"] = "failed" if ev.error else "completed"
 
     async def _on_shutdown() -> None:
-        call_session.end_call(call_id, status=call_status["value"])
+        await asyncio.to_thread(call_session.end_call, call_id, status=call_status["value"])
         try:
             await run_post_call_extraction(call_id)
         except Exception:
