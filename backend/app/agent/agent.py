@@ -63,6 +63,7 @@ AUDIO_SAMPLE_RATE_IN = 16000
 # needed on the way out either.
 AUDIO_SAMPLE_RATE_OUT = 24000
 
+from app.agent import audio_cache  # noqa: E402
 from app.agent import session as call_session  # noqa: E402
 from app.agent.prompts import build_system_prompt  # noqa: E402
 from app.agent.state import SessionData  # noqa: E402
@@ -358,9 +359,38 @@ async def entrypoint(ctx: JobContext) -> None:
         room_input_options=room_io.RoomInputOptions(audio_sample_rate=AUDIO_SAMPLE_RATE_IN),
         room_output_options=room_io.RoomOutputOptions(audio_sample_rate=AUDIO_SAMPLE_RATE_OUT),
     )
-    await session.generate_reply(
-        instructions=f'Greet the caller now. Say almost exactly: "{greeting}"'
+    await _say_greeting(session, greeting, settings)
+
+
+async def _say_greeting(session: AgentSession, greeting: str, settings) -> None:
+    """Speak the fixed greeting without an LLM round-trip.
+
+    Previously this was `generate_reply(instructions=...)`, which paid a full
+    LLM time-to-first-token before the first word (and could paraphrase the
+    greeting). `say()` goes straight to TTS; with a cache hit it skips TTS too
+    and starts streaming audio immediately.
+    """
+    key = audio_cache.cache_key(
+        greeting,
+        speaker=settings.sarvam_tts_speaker,
+        language=settings.sarvam_tts_language,
+        sample_rate=AUDIO_SAMPLE_RATE_OUT,
     )
+    cached = await asyncio.to_thread(audio_cache.load, key)
+    if cached is not None:
+        pcm, sample_rate, num_channels = cached
+        session.say(greeting, audio=audio_cache.frames_from_pcm(pcm, sample_rate, num_channels))
+        return
+
+    handle = session.say(greeting)
+
+    async def _warm_cache() -> None:
+        # After the live greeting has played, so the extra synthesis never
+        # competes with it. One-time cost per greeting/voice per machine.
+        await handle.wait_for_playout()
+        await audio_cache.synthesize_and_save(session.tts, greeting, key)
+
+    asyncio.create_task(_warm_cache(), name="warm-greeting-cache")
 
 
 if __name__ == "__main__":
