@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     # but its Chat Completions API is beta-gated per-account), or "groq" (free
     # tier, needs GROQ_API_KEY from console.groq.com). See app/llm/provider.py.
     llm_provider: str = Field(default="openai", alias="LLM_PROVIDER")
+    # Comma-separated providers to fail over to, in order, when LLM_PROVIDER
+    # errors or times out mid-call (e.g. "groq,sarvam"). Providers whose
+    # credentials are still placeholders are skipped. Empty = no fallback.
+    llm_fallback_providers: str = Field(default="", alias="LLM_FALLBACK_PROVIDERS")
+    # Per-attempt budget before the LLM FallbackAdapter moves to the next
+    # provider. Keep this short: the caller is sitting in silence meanwhile.
+    llm_attempt_timeout: float = Field(default=4.0, alias="LLM_ATTEMPT_TIMEOUT")
     openai_api_key: str = Field(default="YOUR_OPENAI_API_KEY", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
     openai_extraction_model: str = Field(default="gpt-4o-mini", alias="OPENAI_EXTRACTION_MODEL")
@@ -90,6 +97,18 @@ class Settings(BaseSettings):
             absolute = (BACKEND_DIR / relative).resolve()
             return f"sqlite:///{absolute.as_posix()}"
         return v
+
+    @property
+    def llm_fallback_provider_list(self) -> list[str]:
+        return [p.strip().lower() for p in self.llm_fallback_providers.split(",") if p.strip()]
+
+    def provider_has_credentials(self, provider: str) -> bool:
+        key = {
+            "openai": self.openai_api_key,
+            "groq": self.groq_api_key,
+            "sarvam": self.sarvam_api_key,
+        }.get(provider.lower())
+        return key is not None and key not in _PLACEHOLDER_MARKERS and not key.startswith("YOUR_")
 
     @property
     def cors_origin_list(self) -> list[str]:

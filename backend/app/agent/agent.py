@@ -34,6 +34,7 @@ load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 from livekit.agents import (  # noqa: E402
     Agent,
     AgentSession,
+    APIConnectOptions,
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
@@ -43,6 +44,7 @@ from livekit.agents import (  # noqa: E402
     function_tool,
     room_io,
 )
+from livekit.agents.voice.agent_session import SessionConnectOptions  # noqa: E402
 from livekit.plugins import sarvam, silero  # noqa: E402
 
 # All three of these are set to the SAME rate (16kHz) on purpose: it's the
@@ -65,11 +67,27 @@ from app.agent import session as call_session  # noqa: E402
 from app.agent.prompts import build_system_prompt  # noqa: E402
 from app.agent.state import SessionData  # noqa: E402
 from app.business.service import BusinessNotFoundError, render_business_knowledge  # noqa: E402
-from app.llm.provider import get_llm_provider  # noqa: E402
+from app.llm.provider import get_agent_llm_with_fallback  # noqa: E402
 from app.postcall.extractor import run_post_call_extraction  # noqa: E402
 from app.tools import appointments as appointment_tools  # noqa: E402
 
 logger = logging.getLogger("voice_agent.worker")
+
+# Spoken when a turn is lost to a provider failure, so the caller isn't left
+# in silence wondering whether anyone is there. Hinglish on purpose: it reads
+# naturally under the hi-IN Bulbul voice for Hindi and English callers alike.
+TURN_FAILED_MESSAGE = (
+    "Sorry, mujhe thodi technical dikkat aa gayi. Kya aap please apni baat dobara bol sakte hain?"
+)
+
+# LiveKit's defaults (3 retries, 2s apart, 10s timeout) can leave a caller in
+# ~30s of silence before an error surfaces. For a voice call it's better to
+# fail fast and fall back / apologise.
+SESSION_CONN_OPTIONS = SessionConnectOptions(
+    stt_conn_options=APIConnectOptions(max_retry=2, retry_interval=0.5, timeout=5.0),
+    llm_conn_options=APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=5.0),
+    tts_conn_options=APIConnectOptions(max_retry=2, retry_interval=0.5, timeout=5.0),
+)
 
 
 class Assistant(Agent):
@@ -226,8 +244,6 @@ async def entrypoint(ctx: JobContext) -> None:
     message_writer = call_session.CallMessageWriter(call_id)
     logger.info("[call %s] starting session for room=%s agent=%s", call_id, ctx.room.name, agent_name)
 
-    llm_provider = get_llm_provider(settings)
-
     session: AgentSession[SessionData] = AgentSession[SessionData](
         userdata=SessionData(business_id=business_id, call_id=call_id, room_name=ctx.room.name),
         stt=sarvam.STTRealtime(
@@ -236,7 +252,7 @@ async def entrypoint(ctx: JobContext) -> None:
             mode="codemix",  # Hindi/English code-switching, e.g. Hinglish
             sample_rate=AUDIO_SAMPLE_RATE_IN,
         ),
-        llm=llm_provider.get_agent_llm(),
+        llm=get_agent_llm_with_fallback(settings),
         tts=sarvam.TTS(
             api_key=settings.sarvam_api_key,
             target_language_code=settings.sarvam_tts_language,
@@ -246,6 +262,7 @@ async def entrypoint(ctx: JobContext) -> None:
         vad=ctx.proc.userdata["vad"],
         turn_detection="vad",
         allow_interruptions=True,
+        conn_options=SESSION_CONN_OPTIONS,
     )
 
     # ---- Debug/demo logging: transcript, tool calls, latency metrics, turns ----
@@ -298,12 +315,30 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_error(ev) -> None:
         # Never crash the worker over a transient STT/LLM/TTS provider error.
         logger.error("[call %s] session error from %s: %s", call_id, ev.source, ev.error)
+        error = ev.error
+        if getattr(error, "recoverable", True):
+            return  # the framework is retrying; nothing was lost yet
+        # An unrecoverable LLM/STT error means this turn produced no reply.
+        # TTS still works, so tell the caller instead of going silent. (For a
+        # TTS failure there's no voice to apologise with; the session closes
+        # after repeated failures and _on_close ends the call.)
+        if getattr(error, "type", None) in ("llm_error", "stt_error"):
+            try:
+                session.say(TURN_FAILED_MESSAGE, allow_interruptions=True, add_to_chat_ctx=False)
+            except RuntimeError:
+                pass  # session already closing
 
     call_status = {"value": "completed"}
 
     @session.on("close")
     def _on_close(ev) -> None:
         call_status["value"] = "failed" if ev.error else "completed"
+        if ev.error:
+            # The session gave up after repeated provider failures. End the job
+            # so the agent leaves the room and the caller's UI sees the
+            # disconnect, rather than sitting in a silent room.
+            logger.error("[call %s] session closed on error; ending call", call_id)
+            ctx.shutdown(reason="session error")
 
     async def _on_shutdown() -> None:
         # Flush pending transcript writes before closing the call out, so the
