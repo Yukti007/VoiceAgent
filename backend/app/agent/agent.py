@@ -46,7 +46,7 @@ from livekit.agents import (  # noqa: E402
 )
 from livekit.agents import inference  # noqa: E402
 from livekit.agents.voice.agent_session import SessionConnectOptions  # noqa: E402
-from livekit.plugins import sarvam, silero  # noqa: E402
+from livekit.plugins import noise_cancellation, sarvam, silero  # noqa: E402
 
 # All three of these are set to the SAME rate (16kHz) on purpose: it's the
 # rate Sarvam's realtime STT and Silero VAD both require natively. If the
@@ -268,9 +268,41 @@ def _build_turn_handling(settings) -> dict:
             "min_delay": settings.endpointing_min_delay,
             "max_delay": settings.endpointing_max_delay,
         },
-        "interruption": {"enabled": True},
+        "interruption": _build_interruption_options(settings),
         "preemptive_generation": {"enabled": settings.preemptive_generation},
     }
+
+
+def _build_interruption_options(settings) -> dict:
+    """Barge-in config (LiveKit's InterruptionOptions).
+
+    Framework defaults stop Aisha for any detected speech, so an "haan",
+    "hmm" or background noise cut her off mid-sentence. Here the adaptive
+    detector filters backchannels, a minimum duration filters coughs and
+    clicks, and a false interruption (no words follow) resumes her speech
+    after a short pause instead of leaving the turn dropped.
+    """
+    mode = settings.interruption_mode.lower()
+    min_words = settings.interruption_min_words
+    if min_words is None:
+        min_words = 0 if mode == "adaptive" else 2
+    return {
+        "enabled": True,
+        "mode": mode,
+        "min_duration": settings.interruption_min_duration,
+        "min_words": min_words,
+        "resume_false_interruption": True,
+        "false_interruption_timeout": settings.false_interruption_timeout,
+    }
+
+
+def _build_noise_cancellation(settings):
+    mode = settings.noise_cancellation.lower()
+    if mode == "bvc":
+        return noise_cancellation.BVC()
+    if mode == "nc":
+        return noise_cancellation.NC()
+    return None
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -401,8 +433,13 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.start(
         agent=Assistant(instructions=instructions),
         room=ctx.room,
-        room_input_options=room_io.RoomInputOptions(audio_sample_rate=AUDIO_SAMPLE_RATE_IN),
-        room_output_options=room_io.RoomOutputOptions(audio_sample_rate=AUDIO_SAMPLE_RATE_OUT),
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                sample_rate=AUDIO_SAMPLE_RATE_IN,
+                noise_cancellation=_build_noise_cancellation(settings),
+            ),
+            audio_output=room_io.AudioOutputOptions(sample_rate=AUDIO_SAMPLE_RATE_OUT),
+        ),
     )
     await _say_greeting(session, greeting, settings)
 

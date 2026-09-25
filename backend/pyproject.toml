@@ -8,6 +8,7 @@ dependencies = [
     "livekit-plugins-sarvam>=1.8.1,<2",
     "livekit-plugins-openai>=1.8.1,<2",
     "livekit-plugins-silero>=1.8.1,<2",
+    "livekit-plugins-noise-cancellation>=0.3.2,<1",
     "fastapi>=0.141,<1",
     "uvicorn[standard]>=0.53,<1",
     "sqlalchemy>=2.0,<3",

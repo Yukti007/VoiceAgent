@@ -73,6 +73,27 @@ class Settings(BaseSettings):
     # see what's actually available and update this.
     groq_model: str = Field(default="openai/gpt-oss-20b", alias="GROQ_MODEL")
 
+    # --- Interruptions (barge-in) ---
+    # Server-side noise cancellation on the caller's audio before VAD/STT, so
+    # fans, traffic and TV don't register as the caller speaking over Aisha.
+    # "bvc" (background voice cancellation, also removes other people talking
+    # nearby), "nc" (noise only), or "off". BVC/NC need LiveKit Cloud.
+    noise_cancellation: str = Field(default="bvc", alias="NOISE_CANCELLATION")
+    # "adaptive": LiveKit's ML interruption detector, which tells a real
+    # barge-in apart from a backchannel ("haan", "hmm", "achha", "ji") and
+    # degrades to VAD by itself if unavailable. "vad": any speech interrupts.
+    interruption_mode: str = Field(default="adaptive", alias="INTERRUPTION_MODE")
+    # Minimum speech (s) before it counts as an interruption; filters coughs
+    # and clicks.
+    interruption_min_duration: float = Field(default=0.5, alias="INTERRUPTION_MIN_DURATION")
+    # Minimum transcribed words to interrupt. Unset = 0 in adaptive mode (the
+    # model already ignores backchannels, and "ruko" alone must still work)
+    # and 2 in vad mode (the only guard there against one-word backchannels).
+    interruption_min_words: int | None = Field(default=None, alias="INTERRUPTION_MIN_WORDS")
+    # If an "interruption" is followed by this much silence with no words, it
+    # was a false alarm and Aisha resumes where she stopped.
+    false_interruption_timeout: float = Field(default=1.0, alias="FALSE_INTERRUPTION_TIMEOUT")
+
     # --- Agent worker ---
     # Pre-started, prewarmed job processes kept waiting for the next call.
     # LiveKit's dev-mode default is 0, which means every call pays process
@@ -110,6 +131,11 @@ class Settings(BaseSettings):
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8000, alias="API_PORT")
     cors_origins: str = Field(default="http://localhost:3000", alias="CORS_ORIGINS")
+
+    @field_validator("interruption_min_words", mode="before")
+    @classmethod
+    def _empty_means_auto(cls, v):
+        return None if isinstance(v, str) and not v.strip() else v
 
     @field_validator("database_url")
     @classmethod
