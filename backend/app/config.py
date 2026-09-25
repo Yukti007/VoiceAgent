@@ -82,6 +82,22 @@ class Settings(BaseSettings):
     # concurrent call bursts.
     agent_idle_processes: int = Field(default=1, alias="AGENT_IDLE_PROCESSES")
 
+    # --- Turn-taking ---
+    # "model": LiveKit's audio end-of-turn model (inference.TurnDetector) on
+    # top of VAD -- it listens to *how* the caller is speaking, so a
+    # mid-sentence pause ("mujhe... kal ke liye...") isn't mistaken for the
+    # end of the turn. Runs on LiveKit Cloud inference when available, else
+    # a bundled local mini model. "vad": silence-only (the old behaviour).
+    turn_detection: str = Field(default="model", alias="TURN_DETECTION")
+    # Silence (s) before a turn can end when the model is confident the
+    # caller is done, and the most we ever wait when it thinks they're not.
+    endpointing_min_delay: float = Field(default=0.3, alias="ENDPOINTING_MIN_DELAY")
+    endpointing_max_delay: float = Field(default=2.5, alias="ENDPOINTING_MAX_DELAY")
+    # Start the LLM on the transcript before the turn is confirmed; the reply
+    # is ready (or nearly) the moment the turn ends. Costs some extra LLM
+    # tokens when the prediction is discarded.
+    preemptive_generation: bool = Field(default=True, alias="PREEMPTIVE_GENERATION")
+
     # --- Storage ---
     database_url: str = Field(default="sqlite:///./data/voice_agent.db", alias="DATABASE_URL")
 

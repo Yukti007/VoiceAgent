@@ -44,6 +44,7 @@ from livekit.agents import (  # noqa: E402
     function_tool,
     room_io,
 )
+from livekit.agents import inference  # noqa: E402
 from livekit.agents.voice.agent_session import SessionConnectOptions  # noqa: E402
 from livekit.plugins import sarvam, silero  # noqa: E402
 
@@ -247,6 +248,31 @@ def _init_storage() -> None:
     init_db()
 
 
+def _build_turn_handling(settings) -> dict:
+    """Turn-taking config (LiveKit's TurnHandlingOptions, as a plain dict).
+
+    Silence-only VAD forces a bad trade-off: a short silence threshold cuts
+    Hindi/Hinglish speakers off at natural mid-sentence pauses, and a long one
+    adds that delay to every single turn. The audio turn-detection model lets
+    the turn end quickly (min_delay) when the caller is clearly done, and
+    waits up to max_delay only when they sound mid-thought.
+    """
+    turn_detection = (
+        inference.TurnDetector(sample_rate=AUDIO_SAMPLE_RATE_IN)
+        if settings.turn_detection.lower() == "model"
+        else "vad"
+    )
+    return {
+        "turn_detection": turn_detection,
+        "endpointing": {
+            "min_delay": settings.endpointing_min_delay,
+            "max_delay": settings.endpointing_max_delay,
+        },
+        "interruption": {"enabled": True},
+        "preemptive_generation": {"enabled": settings.preemptive_generation},
+    }
+
+
 async def entrypoint(ctx: JobContext) -> None:
     settings = get_settings()
     business_id = settings.default_business_id
@@ -281,8 +307,7 @@ async def entrypoint(ctx: JobContext) -> None:
             speech_sample_rate=AUDIO_SAMPLE_RATE_OUT,
         ),
         vad=ctx.proc.userdata["vad"],
-        turn_detection="vad",
-        allow_interruptions=True,
+        turn_handling=_build_turn_handling(settings),
         conn_options=SESSION_CONN_OPTIONS,
     )
 
