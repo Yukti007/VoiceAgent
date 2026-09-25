@@ -122,3 +122,63 @@ def test_get_business_hours_and_price(business_id):
 
         missing = get_service_price(business, "brain surgery")
         assert missing is None
+
+
+def test_concurrent_bookings_cannot_double_book_a_slot(business_id, monkeypatch):
+    """Two callers (separate sessions/connections, like two worker processes)
+    both see the same slot as free, then both try to book it. Exactly one may
+    succeed."""
+    import threading
+
+    from app.tools import appointments as appointment_tools
+
+    target_date = _first_weekday_with_availability(business_id)
+    with session_scope() as session:
+        slot = check_availability(session, business_id=business_id, date=target_date)["available"][0]
+
+    both_have_read = threading.Barrier(2, timeout=5)
+    original_find = appointment_tools._find_candidate_slots
+
+    def find_then_wait(*args, **kwargs):
+        candidates = original_find(*args, **kwargs)
+        both_have_read.wait()  # force the classic read-read-write-write race
+        return candidates
+
+    monkeypatch.setattr(appointment_tools, "_find_candidate_slots", find_then_wait)
+
+    results: list[dict] = []
+
+    def attempt(phone: str) -> None:
+        with session_scope() as session:
+            results.append(
+                book_appointment(
+                    session,
+                    business_id=business_id,
+                    customer_name=f"Racer {phone}",
+                    customer_phone=phone,
+                    date=target_date,
+                    time=slot["time"],
+                    service="Consultation",
+                    doctor=slot["doctor"],
+                )
+            )
+
+    threads = [threading.Thread(target=attempt, args=(p,)) for p in ("9000000001", "9000000002")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(r["success"] for r in results) == [False, True]
+    with session_scope() as session:
+        booked = (
+            session.query(Appointment)
+            .filter(
+                Appointment.business_id == business_id,
+                Appointment.date == target_date,
+                Appointment.time == slot["time"],
+                Appointment.doctor == slot["doctor"],
+            )
+            .count()
+        )
+    assert booked == 1
