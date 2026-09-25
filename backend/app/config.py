@@ -73,6 +73,15 @@ class Settings(BaseSettings):
     # see what's actually available and update this.
     groq_model: str = Field(default="openai/gpt-oss-20b", alias="GROQ_MODEL")
 
+    # --- Agent worker ---
+    # Pre-started, prewarmed job processes kept waiting for the next call.
+    # LiveKit's dev-mode default is 0, which means every call pays process
+    # start + imports + VAD load before the agent can join ("no warmed
+    # process available for job" in the log). Each idle process costs RAM
+    # (roughly 200-400MB with Silero loaded); size this to expected
+    # concurrent call bursts.
+    agent_idle_processes: int = Field(default=1, alias="AGENT_IDLE_PROCESSES")
+
     # --- Storage ---
     database_url: str = Field(default="sqlite:///./data/voice_agent.db", alias="DATABASE_URL")
 

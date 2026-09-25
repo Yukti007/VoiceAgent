@@ -206,10 +206,29 @@ class Assistant(Agent):
 
 
 def prewarm(proc: JobProcess) -> None:
-    # Loading the (local, ONNX) Silero VAD model is the one meaningfully slow
-    # step, so it happens once per worker process instead of once per call.
+    """Runs once in each idle job process, before any call is assigned to it.
+
+    Everything slow that doesn't depend on the specific call belongs here, so
+    the call itself only pays for connecting to the room.
+    """
+    # Loading the (local, ONNX) Silero VAD model is the slowest step.
     # sample_rate matches AUDIO_SAMPLE_RATE_IN -- see the comment above it.
     proc.userdata["vad"] = silero.VAD.load(sample_rate=AUDIO_SAMPLE_RATE_IN)
+
+    # The openai SDK imports most of its type modules lazily, on first use.
+    # agent_worker.log showed that first use happening mid-call, on the event
+    # loop ("event loop blocked for 1996ms importing openai.types.beta..."),
+    # plus anyio's stream module. Import them now instead.
+    import anyio._core._streams  # noqa: F401
+    import openai.resources  # noqa: F401
+    import openai.types.beta  # noqa: F401
+    import openai.types.chat  # noqa: F401
+    import livekit.plugins.openai.llm  # noqa: F401
+
+    # Create the SQLite engine, connection pool and tables once per process
+    # rather than at the start of every call.
+    _init_storage()
+    proc.userdata["storage_ready"] = True
 
 
 def _load_business_config(business_id: str) -> tuple[str, str, str]:
@@ -235,7 +254,8 @@ async def entrypoint(ctx: JobContext) -> None:
     # Everything below that touches SQLite runs in a worker thread: this event
     # loop also drives audio, VAD and turn detection, and the log showed
     # multi-hundred-ms stalls from synchronous work here.
-    await asyncio.to_thread(_init_storage)
+    if not ctx.proc.userdata.get("storage_ready"):
+        await asyncio.to_thread(_init_storage)
     (instructions, greeting, agent_name), _ = await asyncio.gather(
         asyncio.to_thread(_load_business_config, business_id),
         ctx.connect(),
@@ -409,5 +429,9 @@ if __name__ == "__main__":
             ws_url=settings.livekit_url,
             api_key=settings.livekit_api_key,
             api_secret=settings.livekit_api_secret,
+            num_idle_processes=settings.agent_idle_processes,
+            # prewarm now also does imports + DB init; give slow machines
+            # (the Windows dev box in the logs) room before it's considered hung.
+            initialize_process_timeout=30.0,
         )
     )
