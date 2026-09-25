@@ -11,6 +11,7 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 
@@ -63,7 +64,7 @@ AUDIO_SAMPLE_RATE_OUT = 24000
 from app.agent import session as call_session  # noqa: E402
 from app.agent.prompts import build_system_prompt  # noqa: E402
 from app.agent.state import SessionData  # noqa: E402
-from app.business.service import DatabaseKnowledgeProvider  # noqa: E402
+from app.business.service import BusinessNotFoundError, render_business_knowledge  # noqa: E402
 from app.llm.provider import get_llm_provider  # noqa: E402
 from app.postcall.extractor import run_post_call_extraction  # noqa: E402
 from app.tools import appointments as appointment_tools  # noqa: E402
@@ -93,10 +94,14 @@ class Assistant(Agent):
             doctor: Optional doctor name to filter by (e.g. "Dr. Raj Sharma").
         """
         business_id = context.userdata.business_id
-        with session_scope() as session:
-            result = appointment_tools.check_availability(
-                session, business_id=business_id, date=date, doctor=doctor
-            )
+
+        def _query() -> dict:
+            with session_scope() as session:
+                return appointment_tools.check_availability(
+                    session, business_id=business_id, date=date, doctor=doctor
+                )
+
+        result = await asyncio.to_thread(_query)
         logger.info("[tool] check_availability(%s, doctor=%s) -> %s", date, doctor, result)
         return result
 
@@ -124,17 +129,21 @@ class Assistant(Agent):
             doctor: Optional preferred doctor's name.
         """
         business_id = context.userdata.business_id
-        with session_scope() as session:
-            result = appointment_tools.book_appointment(
-                session,
-                business_id=business_id,
-                customer_name=customer_name,
-                customer_phone=customer_phone,
-                date=date,
-                time=time,
-                service=service,
-                doctor=doctor,
-            )
+
+        def _book() -> dict:
+            with session_scope() as session:
+                return appointment_tools.book_appointment(
+                    session,
+                    business_id=business_id,
+                    customer_name=customer_name,
+                    customer_phone=customer_phone,
+                    date=date,
+                    time=time,
+                    service=service,
+                    doctor=doctor,
+                )
+
+        result = await asyncio.to_thread(_book)
         logger.info("[tool] book_appointment(%s) -> %s", customer_name, result)
         return result
 
@@ -147,9 +156,14 @@ class Assistant(Agent):
         Args:
             day: Optional single day name (e.g. "Saturday"). Omit for the full week.
         """
-        with session_scope() as session:
-            business = session.get(Business, context.userdata.business_id)
-            result = appointment_tools.get_business_hours(business, day)
+        business_id = context.userdata.business_id
+
+        def _query() -> dict:
+            with session_scope() as session:
+                business = session.get(Business, business_id)
+                return appointment_tools.get_business_hours(business, day)
+
+        result = await asyncio.to_thread(_query)
         logger.info("[tool] get_business_hours(day=%s) -> %s", day, result)
         return result
 
@@ -160,9 +174,14 @@ class Assistant(Agent):
         Args:
             service: Name of the service, e.g. "root canal".
         """
-        with session_scope() as session:
-            business = session.get(Business, context.userdata.business_id)
-            result = appointment_tools.get_service_price(business, service)
+        business_id = context.userdata.business_id
+
+        def _query() -> dict | None:
+            with session_scope() as session:
+                business = session.get(Business, business_id)
+                return appointment_tools.get_service_price(business, service)
+
+        result = await asyncio.to_thread(_query)
         logger.info("[tool] get_service_price(%s) -> %s", service, result)
         return result or {"error": f"No pricing information found for '{service}'."}
 
@@ -174,23 +193,37 @@ def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load(sample_rate=AUDIO_SAMPLE_RATE_IN)
 
 
-async def entrypoint(ctx: JobContext) -> None:
+def _load_business_config(business_id: str) -> tuple[str, str, str]:
+    """Sync DB read of everything the session needs up front: (system prompt,
+    greeting, agent name). Run via `asyncio.to_thread` from the entrypoint."""
+    with session_scope() as session:
+        business = session.get(Business, business_id)
+        if business is None:
+            raise BusinessNotFoundError(f"No business with id={business_id!r}")
+        instructions = build_system_prompt(business, render_business_knowledge(business))
+        return instructions, business.greeting, business.agent_name
+
+
+def _init_storage() -> None:
     ensure_dirs()
     init_db()
+
+
+async def entrypoint(ctx: JobContext) -> None:
     settings = get_settings()
-
-    await ctx.connect()
-
     business_id = settings.default_business_id
-    with session_scope() as session:
-        provider = DatabaseKnowledgeProvider(session)
-        business = await provider.get_business(business_id)
-        knowledge_context = await provider.get_context(business_id)
-        instructions = build_system_prompt(business, knowledge_context)
-        greeting = business.greeting
-        agent_name = business.agent_name
 
-    call_id = call_session.create_call(business_id, room_name=ctx.room.name)
+    # Everything below that touches SQLite runs in a worker thread: this event
+    # loop also drives audio, VAD and turn detection, and the log showed
+    # multi-hundred-ms stalls from synchronous work here.
+    await asyncio.to_thread(_init_storage)
+    (instructions, greeting, agent_name), _ = await asyncio.gather(
+        asyncio.to_thread(_load_business_config, business_id),
+        ctx.connect(),
+    )
+
+    call_id = await asyncio.to_thread(call_session.create_call, business_id, ctx.room.name)
+    message_writer = call_session.CallMessageWriter(call_id)
     logger.info("[call %s] starting session for room=%s agent=%s", call_id, ctx.room.name, agent_name)
 
     llm_provider = get_llm_provider(settings)
@@ -228,7 +261,7 @@ async def entrypoint(ctx: JobContext) -> None:
         role = getattr(item, "role", None)
         text = getattr(item, "text_content", None)
         if role in ("user", "assistant") and text:
-            call_session.add_call_message(call_id, role=role, text=text)
+            message_writer.enqueue(role, text)
             logger.info("[call %s] %s: %s", call_id, role, text)
 
     @session.on("metrics_collected")
@@ -273,7 +306,10 @@ async def entrypoint(ctx: JobContext) -> None:
         call_status["value"] = "failed" if ev.error else "completed"
 
     async def _on_shutdown() -> None:
-        call_session.end_call(call_id, status=call_status["value"])
+        # Flush pending transcript writes before closing the call out, so the
+        # post-call extraction sees the complete transcript.
+        await message_writer.aclose()
+        await asyncio.to_thread(call_session.end_call, call_id, call_status["value"])
         try:
             await run_post_call_extraction(call_id)
         except Exception:
