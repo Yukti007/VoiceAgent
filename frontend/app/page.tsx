@@ -144,6 +144,18 @@ export default function Home() {
         }
       });
 
+      room.on(RoomEvent.ParticipantDisconnected, (participant: RemoteParticipant) => {
+        // The agent leaves on its own only when its session failed (e.g.
+        // repeated STT/LLM/TTS provider errors). Tell the caller instead of
+        // leaving them talking into a silent room.
+        if (!participant.isAgent) return;
+        appendLog(`Aisha left the room (identity=${participant.identity})`);
+        setAgentState("idle");
+        setErrorMessage(
+          "Aisha got disconnected because of a technical problem. Please end the conversation and try again.",
+        );
+      });
+
       room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
         if (track.kind === Track.Kind.Audio && !participant.isLocal) {
           if (audioElRef.current) track.attach(audioElRef.current);

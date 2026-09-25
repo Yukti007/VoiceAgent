@@ -11,6 +11,7 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 
@@ -33,6 +34,7 @@ load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 from livekit.agents import (  # noqa: E402
     Agent,
     AgentSession,
+    APIConnectOptions,
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
@@ -42,7 +44,9 @@ from livekit.agents import (  # noqa: E402
     function_tool,
     room_io,
 )
-from livekit.plugins import sarvam, silero  # noqa: E402
+from livekit.agents import inference  # noqa: E402
+from livekit.agents.voice.agent_session import SessionConnectOptions  # noqa: E402
+from livekit.plugins import noise_cancellation, sarvam, silero  # noqa: E402
 
 # All three of these are set to the SAME rate (16kHz) on purpose: it's the
 # rate Sarvam's realtime STT and Silero VAD both require natively. If the
@@ -60,15 +64,39 @@ AUDIO_SAMPLE_RATE_IN = 16000
 # needed on the way out either.
 AUDIO_SAMPLE_RATE_OUT = 24000
 
+from app.agent import audio_cache  # noqa: E402
 from app.agent import session as call_session  # noqa: E402
 from app.agent.prompts import build_system_prompt  # noqa: E402
 from app.agent.state import SessionData  # noqa: E402
-from app.business.service import DatabaseKnowledgeProvider  # noqa: E402
-from app.llm.provider import get_llm_provider  # noqa: E402
+from app.business.service import BusinessNotFoundError, render_business_knowledge  # noqa: E402
+from app.llm.provider import get_agent_llm_with_fallback  # noqa: E402
 from app.postcall.extractor import run_post_call_extraction  # noqa: E402
 from app.tools import appointments as appointment_tools  # noqa: E402
 
 logger = logging.getLogger("voice_agent.worker")
+
+# Spoken when a turn is lost to a provider failure, so the caller isn't left
+# in silence wondering whether anyone is there. Hinglish on purpose: it reads
+# naturally under the hi-IN Bulbul voice for Hindi and English callers alike.
+TURN_FAILED_MESSAGE = (
+    "Sorry, mujhe thodi technical dikkat aa gayi. Kya aap please apni baat dobara bol sakte hain?"
+)
+
+# Spoken only if a tool is still running after FILLER_DELAY seconds of
+# silence, so the caller knows Aisha is working rather than hearing dead air.
+# Fast tool calls never trigger them.
+FILLER_DELAY = 0.8
+AVAILABILITY_FILLER = "Ek second, main availability check kar rahi hoon."
+BOOKING_FILLER = "Ek moment, main aapki booking confirm kar rahi hoon."
+
+# LiveKit's defaults (3 retries, 2s apart, 10s timeout) can leave a caller in
+# ~30s of silence before an error surfaces. For a voice call it's better to
+# fail fast and fall back / apologise.
+SESSION_CONN_OPTIONS = SessionConnectOptions(
+    stt_conn_options=APIConnectOptions(max_retry=2, retry_interval=0.5, timeout=5.0),
+    llm_conn_options=APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=5.0),
+    tts_conn_options=APIConnectOptions(max_retry=2, retry_interval=0.5, timeout=5.0),
+)
 
 
 class Assistant(Agent):
@@ -93,10 +121,15 @@ class Assistant(Agent):
             doctor: Optional doctor name to filter by (e.g. "Dr. Raj Sharma").
         """
         business_id = context.userdata.business_id
-        with session_scope() as session:
-            result = appointment_tools.check_availability(
-                session, business_id=business_id, date=date, doctor=doctor
-            )
+
+        def _query() -> dict:
+            with session_scope() as session:
+                return appointment_tools.check_availability(
+                    session, business_id=business_id, date=date, doctor=doctor
+                )
+
+        async with context.with_filler(AVAILABILITY_FILLER, delay=FILLER_DELAY):
+            result = await asyncio.to_thread(_query)
         logger.info("[tool] check_availability(%s, doctor=%s) -> %s", date, doctor, result)
         return result
 
@@ -123,18 +156,36 @@ class Assistant(Agent):
             service: Service being booked, e.g. "Consultation" or "Teeth whitening".
             doctor: Optional preferred doctor's name.
         """
+        # Critical section: once the booking is being written, a barge-in must
+        # not cancel the speech that confirms it -- otherwise the slot is
+        # booked but the caller never hears it and may try to book again.
+        try:
+            context.disallow_interruptions()
+        except RuntimeError:
+            # The caller already interrupted before we started; don't book on
+            # a turn they talked over.
+            return {
+                "success": False,
+                "error": "Not booked: the caller interrupted. Confirm the details with them again.",
+            }
+
         business_id = context.userdata.business_id
-        with session_scope() as session:
-            result = appointment_tools.book_appointment(
-                session,
-                business_id=business_id,
-                customer_name=customer_name,
-                customer_phone=customer_phone,
-                date=date,
-                time=time,
-                service=service,
-                doctor=doctor,
-            )
+
+        def _book() -> dict:
+            with session_scope() as session:
+                return appointment_tools.book_appointment(
+                    session,
+                    business_id=business_id,
+                    customer_name=customer_name,
+                    customer_phone=customer_phone,
+                    date=date,
+                    time=time,
+                    service=service,
+                    doctor=doctor,
+                )
+
+        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
+            result = await asyncio.to_thread(_book)
         logger.info("[tool] book_appointment(%s) -> %s", customer_name, result)
         return result
 
@@ -147,9 +198,14 @@ class Assistant(Agent):
         Args:
             day: Optional single day name (e.g. "Saturday"). Omit for the full week.
         """
-        with session_scope() as session:
-            business = session.get(Business, context.userdata.business_id)
-            result = appointment_tools.get_business_hours(business, day)
+        business_id = context.userdata.business_id
+
+        def _query() -> dict:
+            with session_scope() as session:
+                business = session.get(Business, business_id)
+                return appointment_tools.get_business_hours(business, day)
+
+        result = await asyncio.to_thread(_query)
         logger.info("[tool] get_business_hours(day=%s) -> %s", day, result)
         return result
 
@@ -160,40 +216,134 @@ class Assistant(Agent):
         Args:
             service: Name of the service, e.g. "root canal".
         """
-        with session_scope() as session:
-            business = session.get(Business, context.userdata.business_id)
-            result = appointment_tools.get_service_price(business, service)
+        business_id = context.userdata.business_id
+
+        def _query() -> dict | None:
+            with session_scope() as session:
+                business = session.get(Business, business_id)
+                return appointment_tools.get_service_price(business, service)
+
+        result = await asyncio.to_thread(_query)
         logger.info("[tool] get_service_price(%s) -> %s", service, result)
         return result or {"error": f"No pricing information found for '{service}'."}
 
 
 def prewarm(proc: JobProcess) -> None:
-    # Loading the (local, ONNX) Silero VAD model is the one meaningfully slow
-    # step, so it happens once per worker process instead of once per call.
+    """Runs once in each idle job process, before any call is assigned to it.
+
+    Everything slow that doesn't depend on the specific call belongs here, so
+    the call itself only pays for connecting to the room.
+    """
+    # Loading the (local, ONNX) Silero VAD model is the slowest step.
     # sample_rate matches AUDIO_SAMPLE_RATE_IN -- see the comment above it.
     proc.userdata["vad"] = silero.VAD.load(sample_rate=AUDIO_SAMPLE_RATE_IN)
 
+    # The openai SDK imports most of its type modules lazily, on first use.
+    # agent_worker.log showed that first use happening mid-call, on the event
+    # loop ("event loop blocked for 1996ms importing openai.types.beta..."),
+    # plus anyio's stream module. Import them now instead.
+    import anyio._core._streams  # noqa: F401
+    import openai.resources  # noqa: F401
+    import openai.types.beta  # noqa: F401
+    import openai.types.chat  # noqa: F401
+    import livekit.plugins.openai.llm  # noqa: F401
 
-async def entrypoint(ctx: JobContext) -> None:
+    # Create the SQLite engine, connection pool and tables once per process
+    # rather than at the start of every call.
+    _init_storage()
+    proc.userdata["storage_ready"] = True
+
+
+def _load_business_config(business_id: str) -> tuple[str, str, str]:
+    """Sync DB read of everything the session needs up front: (system prompt,
+    greeting, agent name). Run via `asyncio.to_thread` from the entrypoint."""
+    with session_scope() as session:
+        business = session.get(Business, business_id)
+        if business is None:
+            raise BusinessNotFoundError(f"No business with id={business_id!r}")
+        instructions = build_system_prompt(business, render_business_knowledge(business))
+        return instructions, business.greeting, business.agent_name
+
+
+def _init_storage() -> None:
     ensure_dirs()
     init_db()
+
+
+def _build_turn_handling(settings) -> dict:
+    """Turn-taking config (LiveKit's TurnHandlingOptions, as a plain dict).
+
+    Silence-only VAD forces a bad trade-off: a short silence threshold cuts
+    Hindi/Hinglish speakers off at natural mid-sentence pauses, and a long one
+    adds that delay to every single turn. The audio turn-detection model lets
+    the turn end quickly (min_delay) when the caller is clearly done, and
+    waits up to max_delay only when they sound mid-thought.
+    """
+    turn_detection = (
+        inference.TurnDetector(sample_rate=AUDIO_SAMPLE_RATE_IN)
+        if settings.turn_detection.lower() == "model"
+        else "vad"
+    )
+    return {
+        "turn_detection": turn_detection,
+        "endpointing": {
+            "min_delay": settings.endpointing_min_delay,
+            "max_delay": settings.endpointing_max_delay,
+        },
+        "interruption": _build_interruption_options(settings),
+        "preemptive_generation": {"enabled": settings.preemptive_generation},
+    }
+
+
+def _build_interruption_options(settings) -> dict:
+    """Barge-in config (LiveKit's InterruptionOptions).
+
+    Framework defaults stop Aisha for any detected speech, so an "haan",
+    "hmm" or background noise cut her off mid-sentence. Here the adaptive
+    detector filters backchannels, a minimum duration filters coughs and
+    clicks, and a false interruption (no words follow) resumes her speech
+    after a short pause instead of leaving the turn dropped.
+    """
+    mode = settings.interruption_mode.lower()
+    min_words = settings.interruption_min_words
+    if min_words is None:
+        min_words = 0 if mode == "adaptive" else 2
+    return {
+        "enabled": True,
+        "mode": mode,
+        "min_duration": settings.interruption_min_duration,
+        "min_words": min_words,
+        "resume_false_interruption": True,
+        "false_interruption_timeout": settings.false_interruption_timeout,
+    }
+
+
+def _build_noise_cancellation(settings):
+    mode = settings.noise_cancellation.lower()
+    if mode == "bvc":
+        return noise_cancellation.BVC()
+    if mode == "nc":
+        return noise_cancellation.NC()
+    return None
+
+
+async def entrypoint(ctx: JobContext) -> None:
     settings = get_settings()
-
-    await ctx.connect()
-
     business_id = settings.default_business_id
-    with session_scope() as session:
-        provider = DatabaseKnowledgeProvider(session)
-        business = await provider.get_business(business_id)
-        knowledge_context = await provider.get_context(business_id)
-        instructions = build_system_prompt(business, knowledge_context)
-        greeting = business.greeting
-        agent_name = business.agent_name
 
-    call_id = call_session.create_call(business_id, room_name=ctx.room.name)
+    # Everything below that touches SQLite runs in a worker thread: this event
+    # loop also drives audio, VAD and turn detection, and the log showed
+    # multi-hundred-ms stalls from synchronous work here.
+    if not ctx.proc.userdata.get("storage_ready"):
+        await asyncio.to_thread(_init_storage)
+    (instructions, greeting, agent_name), _ = await asyncio.gather(
+        asyncio.to_thread(_load_business_config, business_id),
+        ctx.connect(),
+    )
+
+    call_id = await asyncio.to_thread(call_session.create_call, business_id, ctx.room.name)
+    message_writer = call_session.CallMessageWriter(call_id)
     logger.info("[call %s] starting session for room=%s agent=%s", call_id, ctx.room.name, agent_name)
-
-    llm_provider = get_llm_provider(settings)
 
     session: AgentSession[SessionData] = AgentSession[SessionData](
         userdata=SessionData(business_id=business_id, call_id=call_id, room_name=ctx.room.name),
@@ -203,7 +353,7 @@ async def entrypoint(ctx: JobContext) -> None:
             mode="codemix",  # Hindi/English code-switching, e.g. Hinglish
             sample_rate=AUDIO_SAMPLE_RATE_IN,
         ),
-        llm=llm_provider.get_agent_llm(),
+        llm=get_agent_llm_with_fallback(settings),
         tts=sarvam.TTS(
             api_key=settings.sarvam_api_key,
             target_language_code=settings.sarvam_tts_language,
@@ -211,8 +361,8 @@ async def entrypoint(ctx: JobContext) -> None:
             speech_sample_rate=AUDIO_SAMPLE_RATE_OUT,
         ),
         vad=ctx.proc.userdata["vad"],
-        turn_detection="vad",
-        allow_interruptions=True,
+        turn_handling=_build_turn_handling(settings),
+        conn_options=SESSION_CONN_OPTIONS,
     )
 
     # ---- Debug/demo logging: transcript, tool calls, latency metrics, turns ----
@@ -228,7 +378,7 @@ async def entrypoint(ctx: JobContext) -> None:
         role = getattr(item, "role", None)
         text = getattr(item, "text_content", None)
         if role in ("user", "assistant") and text:
-            call_session.add_call_message(call_id, role=role, text=text)
+            message_writer.enqueue(role, text)
             logger.info("[call %s] %s: %s", call_id, role, text)
 
     @session.on("metrics_collected")
@@ -265,15 +415,36 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_error(ev) -> None:
         # Never crash the worker over a transient STT/LLM/TTS provider error.
         logger.error("[call %s] session error from %s: %s", call_id, ev.source, ev.error)
+        error = ev.error
+        if getattr(error, "recoverable", True):
+            return  # the framework is retrying; nothing was lost yet
+        # An unrecoverable LLM/STT error means this turn produced no reply.
+        # TTS still works, so tell the caller instead of going silent. (For a
+        # TTS failure there's no voice to apologise with; the session closes
+        # after repeated failures and _on_close ends the call.)
+        if getattr(error, "type", None) in ("llm_error", "stt_error"):
+            try:
+                session.say(TURN_FAILED_MESSAGE, allow_interruptions=True, add_to_chat_ctx=False)
+            except RuntimeError:
+                pass  # session already closing
 
     call_status = {"value": "completed"}
 
     @session.on("close")
     def _on_close(ev) -> None:
         call_status["value"] = "failed" if ev.error else "completed"
+        if ev.error:
+            # The session gave up after repeated provider failures. End the job
+            # so the agent leaves the room and the caller's UI sees the
+            # disconnect, rather than sitting in a silent room.
+            logger.error("[call %s] session closed on error; ending call", call_id)
+            ctx.shutdown(reason="session error")
 
     async def _on_shutdown() -> None:
-        call_session.end_call(call_id, status=call_status["value"])
+        # Flush pending transcript writes before closing the call out, so the
+        # post-call extraction sees the complete transcript.
+        await message_writer.aclose()
+        await asyncio.to_thread(call_session.end_call, call_id, call_status["value"])
         try:
             await run_post_call_extraction(call_id)
         except Exception:
@@ -284,12 +455,46 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.start(
         agent=Assistant(instructions=instructions),
         room=ctx.room,
-        room_input_options=room_io.RoomInputOptions(audio_sample_rate=AUDIO_SAMPLE_RATE_IN),
-        room_output_options=room_io.RoomOutputOptions(audio_sample_rate=AUDIO_SAMPLE_RATE_OUT),
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                sample_rate=AUDIO_SAMPLE_RATE_IN,
+                noise_cancellation=_build_noise_cancellation(settings),
+            ),
+            audio_output=room_io.AudioOutputOptions(sample_rate=AUDIO_SAMPLE_RATE_OUT),
+        ),
     )
-    await session.generate_reply(
-        instructions=f'Greet the caller now. Say almost exactly: "{greeting}"'
+    await _say_greeting(session, greeting, settings)
+
+
+async def _say_greeting(session: AgentSession, greeting: str, settings) -> None:
+    """Speak the fixed greeting without an LLM round-trip.
+
+    Previously this was `generate_reply(instructions=...)`, which paid a full
+    LLM time-to-first-token before the first word (and could paraphrase the
+    greeting). `say()` goes straight to TTS; with a cache hit it skips TTS too
+    and starts streaming audio immediately.
+    """
+    key = audio_cache.cache_key(
+        greeting,
+        speaker=settings.sarvam_tts_speaker,
+        language=settings.sarvam_tts_language,
+        sample_rate=AUDIO_SAMPLE_RATE_OUT,
     )
+    cached = await asyncio.to_thread(audio_cache.load, key)
+    if cached is not None:
+        pcm, sample_rate, num_channels = cached
+        session.say(greeting, audio=audio_cache.frames_from_pcm(pcm, sample_rate, num_channels))
+        return
+
+    handle = session.say(greeting)
+
+    async def _warm_cache() -> None:
+        # After the live greeting has played, so the extra synthesis never
+        # competes with it. One-time cost per greeting/voice per machine.
+        await handle.wait_for_playout()
+        await audio_cache.synthesize_and_save(session.tts, greeting, key)
+
+    asyncio.create_task(_warm_cache(), name="warm-greeting-cache")
 
 
 if __name__ == "__main__":
@@ -308,5 +513,9 @@ if __name__ == "__main__":
             ws_url=settings.livekit_url,
             api_key=settings.livekit_api_key,
             api_secret=settings.livekit_api_secret,
+            num_idle_processes=settings.agent_idle_processes,
+            # prewarm now also does imports + DB init; give slow machines
+            # (the Windows dev box in the logs) room before it's considered hung.
+            initialize_process_timeout=30.0,
         )
     )

@@ -29,10 +29,12 @@ just Python, SQLite, and a small Next.js frontend.
    abstraction) which decides what to say and which tools to call.
 5. The LLM's reply streams to **Sarvam Bulbul** streaming TTS
    (`livekit-plugins-sarvam`) and plays back through your speakers via LiveKit.
-6. You can **interrupt Aisha mid-sentence** — LiveKit Agents' built-in VAD-based
-   turn detection stops her audio, transcribes your new speech, and lets the
-   LLM respond to your new intent. Nothing here reinvents interruption
-   handling; it's the framework's native behavior.
+6. You can **interrupt Aisha mid-sentence**. Turn-taking uses LiveKit's
+   audio end-of-turn model on top of Silero VAD. Interruptions use LiveKit's
+   adaptive detector (it ignores backchannels like "haan"/"hmm") on
+   noise-cancelled audio, and Aisha resumes after a false interruption.
+   Booking is protected: it can't be interrupted mid-write, and it's
+   idempotent if retried. See "Latency and interruption tuning" below.
 7. Aisha can call real tools: `check_availability`, `book_appointment`,
    `get_business_hours`, `get_service_price` — all backed by SQLite, never
    invented.
@@ -282,11 +284,20 @@ With all three processes running and real credentials in `.env`:
   `hi-IN`). Bulbul speakers read code-mixed Hindi/English text naturally
   under one language setting, so this covers the English/Hindi/Hinglish demo
   well, but per-utterance language/voice switching is not implemented.
-- **Turn detection uses VAD** (`turn_detection="vad"` with Silero, bundled and
-  run locally) rather than LiveKit's hosted semantic turn detector, to avoid
-  depending on LiveKit Cloud inference entitlements for a "low-cost local
-  demo." Barge-in/interruption still works out of the box — this is standard
-  `AgentSession` behavior, not custom code.
+- **Latency and interruption tuning** (all set in `.env`, see `.env.example`):
+  - `TURN_DETECTION=model` uses LiveKit's audio end-of-turn model (LiveKit
+    Cloud inference, with a bundled local fallback). `vad` is silence-only.
+  - `ENDPOINTING_MIN_DELAY` / `ENDPOINTING_MAX_DELAY` and
+    `PREEMPTIVE_GENERATION` set how quickly Aisha starts replying.
+  - `NOISE_CANCELLATION=bvc|nc|off` (bvc/nc need LiveKit Cloud),
+    `INTERRUPTION_MODE=adaptive|vad`, `INTERRUPTION_MIN_DURATION`,
+    `INTERRUPTION_MIN_WORDS` and `FALSE_INTERRUPTION_TIMEOUT` control barge-in.
+  - `LLM_FALLBACK_PROVIDERS` / `LLM_ATTEMPT_TIMEOUT` fail over to another LLM
+    mid-call.
+  - `AGENT_IDLE_PROCESSES` keeps prewarmed worker processes ready so calls
+    don't wait on a cold start.
+  - The greeting is spoken directly, not LLM-generated, and its audio is
+    cached in `backend/data/tts_cache` after the first call.
 - **`next lint` was removed in Next.js 16** (the framework's own CLI no longer
   ships it); the frontend's static check is `npm run typecheck`
   (`tsc --noEmit`) instead of a lint step.

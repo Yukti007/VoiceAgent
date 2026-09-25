@@ -126,9 +126,9 @@ class GroqProvider(LLMProvider):
         return content or "{}"
 
 
-def get_llm_provider(settings: Settings | None = None) -> LLMProvider:
+def get_llm_provider(settings: Settings | None = None, provider: str | None = None) -> LLMProvider:
     settings = settings or get_settings()
-    provider = settings.llm_provider.lower()
+    provider = (provider or settings.llm_provider).lower()
     if provider == "openai":
         return OpenAIProvider(settings)
     if provider == "sarvam":
@@ -136,6 +136,38 @@ def get_llm_provider(settings: Settings | None = None) -> LLMProvider:
     if provider == "groq":
         return GroqProvider(settings)
     raise ValueError(
-        f"Unsupported LLM_PROVIDER={settings.llm_provider!r}. "
+        f"Unsupported LLM provider {provider!r}. "
         "Add a new LLMProvider implementation in app/llm/provider.py to support it."
     )
+
+
+def resolve_provider_chain(settings: Settings | None = None) -> list[str]:
+    """Primary provider first, then each configured fallback that has real
+    credentials, without duplicates."""
+    settings = settings or get_settings()
+    chain = [settings.llm_provider.lower()]
+    for name in settings.llm_fallback_provider_list:
+        if name in chain:
+            continue
+        if not settings.provider_has_credentials(name):
+            logger.warning("LLM fallback provider %r skipped: no credentials configured", name)
+            continue
+        chain.append(name)
+    return chain
+
+
+def get_agent_llm_with_fallback(settings: Settings | None = None):
+    """The realtime agent's LLM. With fallbacks configured this is a LiveKit
+    `llm.FallbackAdapter`: if the active provider errors or exceeds
+    LLM_ATTEMPT_TIMEOUT, the same turn is retried on the next provider (and
+    the failed one is health-checked in the background and restored)."""
+    settings = settings or get_settings()
+    chain = resolve_provider_chain(settings)
+    llms = [get_llm_provider(settings, name).get_agent_llm() for name in chain]
+    if len(llms) == 1:
+        return llms[0]
+
+    from livekit.agents import llm as lk_llm
+
+    logger.info("LLM fallback chain: %s", " -> ".join(chain))
+    return lk_llm.FallbackAdapter(llm=llms, attempt_timeout=settings.llm_attempt_timeout)

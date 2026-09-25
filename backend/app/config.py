@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     # but its Chat Completions API is beta-gated per-account), or "groq" (free
     # tier, needs GROQ_API_KEY from console.groq.com). See app/llm/provider.py.
     llm_provider: str = Field(default="openai", alias="LLM_PROVIDER")
+    # Comma-separated providers to fail over to, in order, when LLM_PROVIDER
+    # errors or times out mid-call (e.g. "groq,sarvam"). Providers whose
+    # credentials are still placeholders are skipped. Empty = no fallback.
+    llm_fallback_providers: str = Field(default="", alias="LLM_FALLBACK_PROVIDERS")
+    # Per-attempt budget before the LLM FallbackAdapter moves to the next
+    # provider. Keep this short: the caller is sitting in silence meanwhile.
+    llm_attempt_timeout: float = Field(default=4.0, alias="LLM_ATTEMPT_TIMEOUT")
     openai_api_key: str = Field(default="YOUR_OPENAI_API_KEY", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
     openai_extraction_model: str = Field(default="gpt-4o-mini", alias="OPENAI_EXTRACTION_MODEL")
@@ -65,6 +72,52 @@ class Settings(BaseSettings):
     # run `GET https://api.groq.com/openai/v1/models` with your own key to
     # see what's actually available and update this.
     groq_model: str = Field(default="openai/gpt-oss-20b", alias="GROQ_MODEL")
+
+    # --- Interruptions (barge-in) ---
+    # Server-side noise cancellation on the caller's audio before VAD/STT, so
+    # fans, traffic and TV don't register as the caller speaking over Aisha.
+    # "bvc" (background voice cancellation, also removes other people talking
+    # nearby), "nc" (noise only), or "off". BVC/NC need LiveKit Cloud.
+    noise_cancellation: str = Field(default="bvc", alias="NOISE_CANCELLATION")
+    # "adaptive": LiveKit's ML interruption detector, which tells a real
+    # barge-in apart from a backchannel ("haan", "hmm", "achha", "ji") and
+    # degrades to VAD by itself if unavailable. "vad": any speech interrupts.
+    interruption_mode: str = Field(default="adaptive", alias="INTERRUPTION_MODE")
+    # Minimum speech (s) before it counts as an interruption; filters coughs
+    # and clicks.
+    interruption_min_duration: float = Field(default=0.5, alias="INTERRUPTION_MIN_DURATION")
+    # Minimum transcribed words to interrupt. Unset = 0 in adaptive mode (the
+    # model already ignores backchannels, and "ruko" alone must still work)
+    # and 2 in vad mode (the only guard there against one-word backchannels).
+    interruption_min_words: int | None = Field(default=None, alias="INTERRUPTION_MIN_WORDS")
+    # If an "interruption" is followed by this much silence with no words, it
+    # was a false alarm and Aisha resumes where she stopped.
+    false_interruption_timeout: float = Field(default=1.0, alias="FALSE_INTERRUPTION_TIMEOUT")
+
+    # --- Agent worker ---
+    # Pre-started, prewarmed job processes kept waiting for the next call.
+    # LiveKit's dev-mode default is 0, which means every call pays process
+    # start + imports + VAD load before the agent can join ("no warmed
+    # process available for job" in the log). Each idle process costs RAM
+    # (roughly 200-400MB with Silero loaded); size this to expected
+    # concurrent call bursts.
+    agent_idle_processes: int = Field(default=1, alias="AGENT_IDLE_PROCESSES")
+
+    # --- Turn-taking ---
+    # "model": LiveKit's audio end-of-turn model (inference.TurnDetector) on
+    # top of VAD -- it listens to *how* the caller is speaking, so a
+    # mid-sentence pause ("mujhe... kal ke liye...") isn't mistaken for the
+    # end of the turn. Runs on LiveKit Cloud inference when available, else
+    # a bundled local mini model. "vad": silence-only (the old behaviour).
+    turn_detection: str = Field(default="model", alias="TURN_DETECTION")
+    # Silence (s) before a turn can end when the model is confident the
+    # caller is done, and the most we ever wait when it thinks they're not.
+    endpointing_min_delay: float = Field(default=0.3, alias="ENDPOINTING_MIN_DELAY")
+    endpointing_max_delay: float = Field(default=2.5, alias="ENDPOINTING_MAX_DELAY")
+    # Start the LLM on the transcript before the turn is confirmed; the reply
+    # is ready (or nearly) the moment the turn ends. Costs some extra LLM
+    # tokens when the prediction is discarded.
+    preemptive_generation: bool = Field(default=True, alias="PREEMPTIVE_GENERATION")
 
     # --- Storage ---
     database_url: str = Field(default="sqlite:///./data/voice_agent.db", alias="DATABASE_URL")
@@ -79,6 +132,11 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000, alias="API_PORT")
     cors_origins: str = Field(default="http://localhost:3000", alias="CORS_ORIGINS")
 
+    @field_validator("interruption_min_words", mode="before")
+    @classmethod
+    def _empty_means_auto(cls, v):
+        return None if isinstance(v, str) and not v.strip() else v
+
     @field_validator("database_url")
     @classmethod
     def _resolve_sqlite_path(cls, v: str) -> str:
@@ -90,6 +148,18 @@ class Settings(BaseSettings):
             absolute = (BACKEND_DIR / relative).resolve()
             return f"sqlite:///{absolute.as_posix()}"
         return v
+
+    @property
+    def llm_fallback_provider_list(self) -> list[str]:
+        return [p.strip().lower() for p in self.llm_fallback_providers.split(",") if p.strip()]
+
+    def provider_has_credentials(self, provider: str) -> bool:
+        key = {
+            "openai": self.openai_api_key,
+            "groq": self.groq_api_key,
+            "sarvam": self.sarvam_api_key,
+        }.get(provider.lower())
+        return key is not None and key not in _PLACEHOLDER_MARKERS and not key.startswith("YOUR_")
 
     @property
     def cors_origin_list(self) -> list[str]:

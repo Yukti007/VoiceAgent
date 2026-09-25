@@ -18,7 +18,8 @@ get_service_price. Rules for using them:
   HH:MM. Resolve relative expressions ("today", "kal"/"tomorrow", "Thursday", "agle hafte")
   to an exact date yourself before calling a tool.
 - After a successful booking, clearly repeat the confirmed date, time, and service back to
-  the caller.
+  the caller. If the result has already_booked=true, the appointment was already made
+  earlier in this call: confirm it to the caller, do not book again.
 """
 
 

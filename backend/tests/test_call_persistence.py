@@ -32,3 +32,24 @@ def test_call_lifecycle_and_message_ordering(business_id):
         assert call.ended_at is not None
         assert call.duration_seconds is not None
         assert call.duration_seconds >= 0
+
+
+async def test_call_message_writer_persists_in_order_off_loop(business_id):
+    from app.agent.session import CallMessageWriter
+
+    call_id = create_call(business_id, room_name="test-room-writer")
+    writer = CallMessageWriter(call_id)
+    for i in range(20):
+        writer.enqueue("user" if i % 2 else "assistant", f"message {i}")
+    writer.enqueue("user", "  ")  # blank text must be dropped
+    await writer.aclose()
+
+    with session_scope() as session:
+        texts = [
+            m.text
+            for m in session.query(CallMessage)
+            .filter(CallMessage.call_id == call_id)
+            .order_by(CallMessage.timestamp, CallMessage.id)
+            .all()
+        ]
+    assert texts == [f"message {i}" for i in range(20)]
