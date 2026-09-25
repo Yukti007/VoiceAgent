@@ -19,7 +19,7 @@ from datetime import datetime
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from app.database.models import Appointment, AppointmentSlot, Business
+from app.database.models import Appointment, AppointmentSlot, Business, Customer
 from app.tools.customer import get_or_create_customer
 
 WEEKDAY_NAMES = [
@@ -147,6 +147,19 @@ def book_appointment(
     except InvalidDateError as exc:
         return {"success": False, "error": str(exc)}
 
+    # Idempotency: if this caller already holds a confirmed appointment at
+    # exactly this date/time, this is a retry (e.g. the confirmation was
+    # interrupted and the LLM called the tool again), not a second booking.
+    existing = _find_existing_booking(
+        session,
+        business_id=business_id,
+        customer_phone=customer_phone,
+        date=parsed_date.isoformat(),
+        time=parsed_time,
+    )
+    if existing is not None:
+        return _booking_result(existing, existing.customer.name, already_booked=True)
+
     slot = None
     for candidate in _find_candidate_slots(
         session,
@@ -185,15 +198,41 @@ def book_appointment(
     session.add(appointment)
     session.flush()
 
-    return {
+    return _booking_result(appointment, customer.name)
+
+
+def _booking_result(appointment: Appointment, customer_name: str, *, already_booked: bool = False) -> dict:
+    result = {
         "success": True,
         "appointment_id": appointment.id,
         "date": appointment.date,
         "time": appointment.time,
         "service": appointment.service,
         "doctor": appointment.doctor,
-        "customer_name": customer.name,
+        "customer_name": customer_name,
     }
+    if already_booked:
+        result["already_booked"] = True
+    return result
+
+
+def _find_existing_booking(
+    session: Session, *, business_id: str, customer_phone: str | None, date: str, time: str
+) -> Appointment | None:
+    if not customer_phone:
+        return None
+    return session.execute(
+        select(Appointment)
+        .join(Customer, Appointment.customer_id == Customer.id)
+        .where(
+            Appointment.business_id == business_id,
+            Appointment.date == date,
+            Appointment.time == time,
+            Appointment.status == "confirmed",
+            Customer.phone == customer_phone,
+        )
+        .limit(1)
+    ).scalar_one_or_none()
 
 
 def _find_candidate_slots(

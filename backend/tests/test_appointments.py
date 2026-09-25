@@ -182,3 +182,37 @@ def test_concurrent_bookings_cannot_double_book_a_slot(business_id, monkeypatch)
             .count()
         )
     assert booked == 1
+
+
+def test_book_appointment_is_idempotent_for_same_caller_and_slot(business_id):
+    """A retried booking (e.g. after the confirmation was interrupted) must
+    return the existing appointment, not fail or create a second one."""
+    target_date = _first_weekday_with_availability(business_id)
+    with session_scope() as session:
+        slot = check_availability(session, business_id=business_id, date=target_date)["available"][0]
+
+    kwargs = dict(
+        business_id=business_id,
+        customer_name="Retry Patient",
+        customer_phone="9000000099",
+        date=target_date,
+        time=slot["time"],
+        service="Consultation",
+        doctor=slot["doctor"],
+    )
+    with session_scope() as session:
+        first = book_appointment(session, **kwargs)
+    with session_scope() as session:
+        retry = book_appointment(session, **kwargs)
+
+    assert first["success"] is True and "already_booked" not in first
+    assert retry["success"] is True and retry["already_booked"] is True
+    assert retry["appointment_id"] == first["appointment_id"]
+    with session_scope() as session:
+        count = (
+            session.query(Appointment)
+            .filter(Appointment.date == target_date, Appointment.time == slot["time"])
+            .filter(Appointment.doctor == slot["doctor"])
+            .count()
+        )
+    assert count == 1

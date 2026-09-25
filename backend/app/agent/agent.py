@@ -82,6 +82,13 @@ TURN_FAILED_MESSAGE = (
     "Sorry, mujhe thodi technical dikkat aa gayi. Kya aap please apni baat dobara bol sakte hain?"
 )
 
+# Spoken only if a tool is still running after FILLER_DELAY seconds of
+# silence, so the caller knows Aisha is working rather than hearing dead air.
+# Fast tool calls never trigger them.
+FILLER_DELAY = 0.8
+AVAILABILITY_FILLER = "Ek second, main availability check kar rahi hoon."
+BOOKING_FILLER = "Ek moment, main aapki booking confirm kar rahi hoon."
+
 # LiveKit's defaults (3 retries, 2s apart, 10s timeout) can leave a caller in
 # ~30s of silence before an error surfaces. For a voice call it's better to
 # fail fast and fall back / apologise.
@@ -121,7 +128,8 @@ class Assistant(Agent):
                     session, business_id=business_id, date=date, doctor=doctor
                 )
 
-        result = await asyncio.to_thread(_query)
+        async with context.with_filler(AVAILABILITY_FILLER, delay=FILLER_DELAY):
+            result = await asyncio.to_thread(_query)
         logger.info("[tool] check_availability(%s, doctor=%s) -> %s", date, doctor, result)
         return result
 
@@ -148,6 +156,19 @@ class Assistant(Agent):
             service: Service being booked, e.g. "Consultation" or "Teeth whitening".
             doctor: Optional preferred doctor's name.
         """
+        # Critical section: once the booking is being written, a barge-in must
+        # not cancel the speech that confirms it -- otherwise the slot is
+        # booked but the caller never hears it and may try to book again.
+        try:
+            context.disallow_interruptions()
+        except RuntimeError:
+            # The caller already interrupted before we started; don't book on
+            # a turn they talked over.
+            return {
+                "success": False,
+                "error": "Not booked: the caller interrupted. Confirm the details with them again.",
+            }
+
         business_id = context.userdata.business_id
 
         def _book() -> dict:
@@ -163,7 +184,8 @@ class Assistant(Agent):
                     doctor=doctor,
                 )
 
-        result = await asyncio.to_thread(_book)
+        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
+            result = await asyncio.to_thread(_book)
         logger.info("[tool] book_appointment(%s) -> %s", customer_name, result)
         return result
 
