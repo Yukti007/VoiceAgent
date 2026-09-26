@@ -53,3 +53,13 @@ def test_noise_cancellation_modes():
     assert _build_noise_cancellation(_settings(NOISE_CANCELLATION="off")) is None
     assert _build_noise_cancellation(_settings(NOISE_CANCELLATION="bvc")) is not None
     assert _build_noise_cancellation(_settings(NOISE_CANCELLATION="nc")) is not None
+
+
+def test_tts_language_follows_the_reply_script_not_the_caller():
+    from app.agent.agent import tts_language_for
+
+    assert tts_language_for("I have your number as nine eight nine nine") == "en-IN"
+    assert tts_language_for("आपका नंबर नौ आठ नौ नौ है") == "hi-IN"
+    assert tts_language_for("Sorry, mujhe thodi dikkat aa gayi") == "en-IN"
+    assert tts_language_for("Great! क्या आप हमें अपना फोन नंबर दे सकते हैं") == "hi-IN"
+    assert tts_language_for("3242 6872") is None
