@@ -6,7 +6,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Iterator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -23,7 +23,20 @@ def get_engine() -> Engine:
         settings = get_settings()
         connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
         _engine = create_engine(settings.database_url, connect_args=connect_args, future=True)
+        if settings.database_url.startswith("sqlite"):
+            event.listen(_engine, "connect", _configure_sqlite_connection)
     return _engine
+
+
+def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+    """Every LiveKit call runs in its own worker process, so several processes
+    can write to the same SQLite file at once. WAL lets reads proceed during a
+    write, and busy_timeout makes a writer wait for the lock instead of
+    failing immediately with "database is locked"."""
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=5000")
+    cursor.close()
 
 
 def get_sessionmaker() -> sessionmaker:

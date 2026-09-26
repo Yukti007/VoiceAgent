@@ -7,6 +7,8 @@ Keeping the logic here (instead of inline in the agent) means:
   - `check_availability` can never be "talked into" inventing a slot -- it only
     ever returns rows that actually exist in `appointment_slots`
   - `book_appointment` only ever reports success after a real SQLite write
+  - two concurrent callers can never both get the same slot: claiming a slot
+    is a single conditional UPDATE (see `_claim_slot`), not read-then-write
 """
 
 from __future__ import annotations
@@ -14,10 +16,10 @@ from __future__ import annotations
 from datetime import date as date_cls
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from app.database.models import Appointment, AppointmentSlot, Business
+from app.database.models import Appointment, AppointmentSlot, Business, Customer
 from app.tools.customer import get_or_create_customer
 
 WEEKDAY_NAMES = [
@@ -145,15 +147,30 @@ def book_appointment(
     except InvalidDateError as exc:
         return {"success": False, "error": str(exc)}
 
-    query = select(AppointmentSlot).where(
-        AppointmentSlot.business_id == business_id,
-        AppointmentSlot.date == parsed_date.isoformat(),
-        AppointmentSlot.time == parsed_time,
-        AppointmentSlot.is_booked.is_(False),
+    # Idempotency: if this caller already holds a confirmed appointment at
+    # exactly this date/time, this is a retry (e.g. the confirmation was
+    # interrupted and the LLM called the tool again), not a second booking.
+    existing = _find_existing_booking(
+        session,
+        business_id=business_id,
+        customer_phone=customer_phone,
+        date=parsed_date.isoformat(),
+        time=parsed_time,
     )
-    if doctor:
-        query = query.where(AppointmentSlot.doctor == doctor)
-    slot = session.execute(query.limit(1)).scalar_one_or_none()
+    if existing is not None:
+        return _booking_result(existing, existing.customer.name, already_booked=True)
+
+    slot = None
+    for candidate in _find_candidate_slots(
+        session,
+        business_id=business_id,
+        date=parsed_date.isoformat(),
+        time=parsed_time,
+        doctor=doctor,
+    ):
+        if _claim_slot(session, candidate.id):
+            slot = candidate
+            break
 
     if slot is None:
         return {
@@ -169,8 +186,6 @@ def book_appointment(
         session, business_id=business_id, name=customer_name, phone=customer_phone
     )
 
-    slot.is_booked = True
-
     appointment = Appointment(
         business_id=business_id,
         customer_id=customer.id,
@@ -183,12 +198,76 @@ def book_appointment(
     session.add(appointment)
     session.flush()
 
-    return {
+    return _booking_result(appointment, customer.name)
+
+
+def _booking_result(appointment: Appointment, customer_name: str, *, already_booked: bool = False) -> dict:
+    result = {
         "success": True,
         "appointment_id": appointment.id,
         "date": appointment.date,
         "time": appointment.time,
         "service": appointment.service,
         "doctor": appointment.doctor,
-        "customer_name": customer.name,
+        "customer_name": customer_name,
     }
+    if already_booked:
+        result["already_booked"] = True
+    return result
+
+
+def _find_existing_booking(
+    session: Session, *, business_id: str, customer_phone: str | None, date: str, time: str
+) -> Appointment | None:
+    if not customer_phone:
+        return None
+    return session.execute(
+        select(Appointment)
+        .join(Customer, Appointment.customer_id == Customer.id)
+        .where(
+            Appointment.business_id == business_id,
+            Appointment.date == date,
+            Appointment.time == time,
+            Appointment.status == "confirmed",
+            Customer.phone == customer_phone,
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _find_candidate_slots(
+    session: Session, *, business_id: str, date: str, time: str, doctor: str | None
+) -> list[AppointmentSlot]:
+    """Open slots matching the request. This read is only a hint -- another
+    caller may take any of them before we claim it, which `_claim_slot` handles."""
+    query = select(AppointmentSlot).where(
+        AppointmentSlot.business_id == business_id,
+        AppointmentSlot.date == date,
+        AppointmentSlot.time == time,
+        AppointmentSlot.is_booked.is_(False),
+    )
+    if doctor:
+        query = query.where(AppointmentSlot.doctor == doctor)
+    return list(session.execute(query.order_by(AppointmentSlot.doctor)).scalars().all())
+
+
+def _claim_slot(session: Session, slot_id: int) -> bool:
+    """Atomically mark a slot booked, but only if it's still free.
+
+    A single `UPDATE ... WHERE is_booked = false` is atomic in both SQLite
+    and Postgres: if a concurrent booking (another call, in another worker
+    process) got there first, this matches zero rows and we report the slot
+    as taken instead of silently double-booking it.
+    """
+    result = session.execute(
+        update(AppointmentSlot)
+        .where(AppointmentSlot.id == slot_id, AppointmentSlot.is_booked.is_(False))
+        .values(is_booked=True)
+        .execution_options(synchronize_session=False)
+    )
+    claimed = result.rowcount == 1
+    if claimed:
+        slot = session.get(AppointmentSlot, slot_id)
+        if slot is not None:
+            session.refresh(slot)
+    return claimed
