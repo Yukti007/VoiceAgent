@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from collections.abc import AsyncIterable, AsyncIterator
 
 from dotenv import load_dotenv
 
@@ -38,6 +39,7 @@ from livekit.agents import (  # noqa: E402
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
+    ModelSettings,
     RunContext,
     WorkerOptions,
     cli,
@@ -100,6 +102,20 @@ SESSION_CONN_OPTIONS = SessionConnectOptions(
 )
 
 
+# How much of a reply to read before choosing the TTS language for it.
+_TTS_LANGUAGE_PEEK_LETTERS = 12
+
+
+def tts_language_for(text: str) -> str | None:
+    """Bulbul target language for a reply, from its script: Devanagari ->
+    hi-IN, Latin -> en-IN, None if there are no letters to judge by yet."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return None
+    devanagari = sum(1 for c in letters if "ऀ" <= c <= "ॿ")
+    return "hi-IN" if devanagari * 2 >= len(letters) else "en-IN"
+
+
 class Assistant(Agent):
     """Aisha. Business knowledge + tool-use rules live in the system prompt
     (see app/agent/prompts.py + the seeded Business row); this class only
@@ -107,6 +123,37 @@ class Assistant(Agent):
 
     def __init__(self, *, instructions: str) -> None:
         super().__init__(instructions=instructions)
+
+    async def tts_node(self, text: AsyncIterable[str], model_settings: ModelSettings):
+        """Voice each reply in the language it is written in.
+
+        The TTS language used to follow the caller's last utterance, so a caller
+        speaking Hinglish in Devanagari got English replies read with a Hindi
+        voice -- phone numbers came out as Hindi numerals ("battees bayalees")
+        even when the caller asked for English. Peek at the start of the reply,
+        pick the language from its script, then synthesize as normal."""
+        head: list[str] = []
+        stream = text.__aiter__()
+        async for chunk in stream:
+            head.append(chunk)
+            if sum(c.isalpha() for c in "".join(head)) >= _TTS_LANGUAGE_PEEK_LETTERS:
+                break
+
+        target = tts_language_for("".join(head))
+        tts = self.session.tts
+        if target and tts is not None and getattr(tts, "_opts", None) is not None:
+            if tts._opts.target_language_code != target:
+                tts.update_options(target_language_code=target)
+                logger.info("TTS target_language_code -> %s", target)
+
+        async def _replay() -> AsyncIterator[str]:
+            for chunk in head:
+                yield chunk
+            async for chunk in stream:
+                yield chunk
+
+        async for frame in Agent.default.tts_node(self, _replay(), model_settings):
+            yield frame
 
     @function_tool()
     async def check_availability(
@@ -476,28 +523,12 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # ---- Debug/demo logging: transcript, tool calls, latency metrics, turns ----
 
-    # Bulbul's target_language_code is set once at TTS construction (hi-IN, above)
-    # but the caller's actual language varies turn by turn -- a real test call
-    # showed Bulbul mispronouncing plain English words ("I'm" -> "Im", "Wednesday")
-    # when synthesizing an English reply under a Hindi target. Sarvam's realtime STT
-    # reports a detected `language` per final transcript (already logged below);
-    # retarget the TTS to match it before the next reply is generated, using
-    # sarvam.TTS.update_options (a real runtime API, not a full reconnect). Only
-    # "en" and "hi" are mapped since that's this demo's supported range -- anything
-    # else (misdetection, silence) is left on whatever language is already active
-    # rather than guessed at.
-    _stt_lang_to_tts_target = {"en": "en-IN", "hi": "hi-IN"}
-    _last_tts_target = {"value": settings.sarvam_tts_language}
-
+    # The TTS language is chosen per reply from the reply's own script -- see
+    # Assistant.tts_node -- not from the caller's detected language.
     @session.on("user_input_transcribed")
     def _on_user_transcribed(ev) -> None:
         if ev.is_final:
             logger.info("[call %s] STT final: %r (lang=%s)", call_id, ev.transcript, ev.language)
-            target = ev.language and _stt_lang_to_tts_target.get(ev.language.language)
-            if target and target != _last_tts_target["value"]:
-                _last_tts_target["value"] = target
-                session.tts.update_options(target_language_code=target)
-                logger.info("[call %s] TTS target_language_code -> %s", call_id, target)
 
     @session.on("conversation_item_added")
     def _on_item_added(ev) -> None:
