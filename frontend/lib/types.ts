@@ -57,4 +57,6 @@ export interface TranscriptEntry {
   speaker: "you" | "aisha";
   text: string;
   final: boolean;
+  /** Epoch ms when the segment first arrived; kept stable across interim updates. */
+  time: number;
 }

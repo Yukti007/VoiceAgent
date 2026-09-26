@@ -4,6 +4,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Room, RoomEvent, Track } from "livekit-client";
 import type { RemoteParticipant, TranscriptionSegment } from "livekit-client";
 
+import { ChatPanel } from "@/components/ChatPanel";
+import { ChatIcon, ChevronIcon, MicIcon, PhoneDownIcon } from "@/components/icons";
+import { VoiceOrb } from "@/components/VoiceOrb";
 import { createToken, getBusiness, getCallExtraction, listCallsByRoom } from "@/lib/api";
 import type {
   AgentState,
@@ -15,6 +18,8 @@ import type {
 } from "@/lib/types";
 
 const BUSINESS_ID = process.env.NEXT_PUBLIC_DEFAULT_BUSINESS_ID ?? "sharma-dental";
+const CHAT_PANEL_ID = "transcript-panel";
+const WIDE_LAYOUT_QUERY = "(min-width: 960px)";
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -26,15 +31,22 @@ function upsertTranscript(
   speaker: "you" | "aisha",
 ): TranscriptEntry[] {
   const idx = prev.findIndex((e) => e.id === seg.id);
-  const entry: TranscriptEntry = { id: seg.id, speaker, text: seg.text, final: seg.final };
+  const time = idx === -1 ? Date.now() : prev[idx].time;
+  const entry: TranscriptEntry = { id: seg.id, speaker, text: seg.text, final: seg.final, time };
   if (idx === -1) return [...prev, entry];
   const next = [...prev];
   next[idx] = entry;
   return next;
 }
 
+function formatElapsed(totalSeconds: number) {
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
 const AGENT_STATE_LABEL: Record<AgentState, string> = {
-  idle: "Idle",
+  idle: "Ready when you are",
   initializing: "Connecting to Aisha…",
   listening: "Listening",
   thinking: "Thinking",
@@ -42,10 +54,19 @@ const AGENT_STATE_LABEL: Record<AgentState, string> = {
 };
 
 const MIC_LABEL: Record<MicState, string> = {
-  not_started: "Not started",
-  requesting: "Requesting permission…",
-  granted: "Connected",
-  denied: "Permission denied",
+  not_started: "Mic off",
+  requesting: "Requesting mic…",
+  granted: "Mic on",
+  denied: "Mic blocked",
+};
+
+const CONNECTION_LABEL: Record<ConnectionState, string> = {
+  idle: "Not connected",
+  connecting: "Connecting",
+  connected: "Connected",
+  ending: "Ending",
+  disconnected: "Call ended",
+  error: "Connection error",
 };
 
 export default function Home() {
@@ -59,6 +80,9 @@ export default function Home() {
   const [extraction, setExtraction] = useState<CallExtraction | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [waitingForResult, setWaitingForResult] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [seenCount, setSeenCount] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
 
   const roomRef = useRef<Room | null>(null);
   const roomNameRef = useRef<string | null>(null);
@@ -90,6 +114,34 @@ export default function Home() {
     };
   }, []);
 
+  // Messages count as read while the panel is open; the badge shows the rest.
+  useEffect(() => {
+    if (chatOpen) setSeenCount(transcript.length);
+  }, [chatOpen, transcript.length]);
+
+  const unread = Math.max(0, transcript.length - seenCount);
+
+  // Close the mobile sheet with Escape.
+  useEffect(() => {
+    if (!chatOpen) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setChatOpen(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [chatOpen]);
+
+  const isConnecting = connectionState === "connecting";
+  const isEnding = connectionState === "ending";
+  const isBusy = isConnecting || isEnding;
+  const isConnected = connectionState === "connected";
+
+  useEffect(() => {
+    if (!isConnected) return;
+    const startedAt = Date.now();
+    setElapsed(0);
+    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [isConnected]);
+
   const pollForCallId = useCallback(
     async (roomName: string) => {
       for (let i = 0; i < 10; i++) {
@@ -112,10 +164,12 @@ export default function Home() {
   const handleStart = useCallback(async () => {
     setErrorMessage(null);
     setTranscript([]);
+    setSeenCount(0);
     setExtraction(null);
     setCallId(null);
     setConnectionState("connecting");
     setMicState("requesting");
+    if (window.matchMedia(WIDE_LAYOUT_QUERY).matches) setChatOpen(true);
     appendLog("Requesting LiveKit access token from backend...");
 
     try {
@@ -210,6 +264,7 @@ export default function Home() {
     const roomName = roomNameRef.current;
     setConnectionState("disconnected");
     setAgentState("idle");
+    setMicState("not_started");
 
     if (roomName) {
       setWaitingForResult(true);
@@ -240,155 +295,171 @@ export default function Home() {
     }
   }, [appendLog]);
 
-  const micDotClass = useMemo(() => {
-    if (micState === "granted") return "dot on";
-    if (micState === "requesting") return "dot pending";
-    if (micState === "denied") return "dot error";
-    return "dot off";
-  }, [micState]);
+  const languages = useMemo(
+    () =>
+      (business?.supported_languages ?? ["English", "Hindi", "Hinglish"])
+        .map((l) => {
+          const lower = l.toLowerCase();
+          if (lower.includes("hinglish")) return "Hinglish";
+          if (lower.startsWith("en")) return "English";
+          if (lower.startsWith("hi")) return "Hindi";
+          return l;
+        })
+        .filter((v, i, arr) => arr.indexOf(v) === i),
+    [business],
+  );
 
-  const connectionDotClass = useMemo(() => {
-    if (connectionState === "connected") return "dot on";
-    if (connectionState === "connecting" || connectionState === "ending") return "dot pending";
-    if (connectionState === "error") return "dot error";
-    return "dot off";
-  }, [connectionState]);
+  const micTone =
+    micState === "granted" ? "on" : micState === "requesting" ? "pending" : micState === "denied" ? "error" : "off";
+  const connectionTone =
+    connectionState === "connected"
+      ? "on"
+      : isBusy
+        ? "pending"
+        : connectionState === "error"
+          ? "error"
+          : "off";
 
-  const isConnecting = connectionState === "connecting";
-  const isEnding = connectionState === "ending";
-  const isBusy = isConnecting || isEnding;
-  const isConnected = connectionState === "connected";
+  const agentName = business?.agent_name ?? "Aisha";
 
   return (
-    <main className="page">
+    <div className={`shell${chatOpen ? " chat-open" : ""}`}>
       <audio ref={audioElRef} autoPlay />
+      <div className="backdrop-blob b1" aria-hidden />
+      <div className="backdrop-blob b2" aria-hidden />
+      <div className="backdrop-blob b3" aria-hidden />
 
-      <header className="header">
-        <span className="business-name">{business?.name ?? "Sharma Dental Care"}</span>
-        <span className="agent-name">{business?.agent_name ?? "Aisha"}</span>
-        <span className="agent-role">AI Receptionist</span>
-        <span className="languages">
-          {(business?.supported_languages ?? ["English", "Hindi", "Hinglish"])
-            .map((l) => {
-              const lower = l.toLowerCase();
-              if (lower.includes("hinglish")) return "Hinglish";
-              if (lower.startsWith("en")) return "English";
-              if (lower.startsWith("hi")) return "Hindi";
-              return l;
-            })
-            .filter((v, i, arr) => arr.indexOf(v) === i)
-            .join(" • ")}
-        </span>
-      </header>
+      <main className="main">
+        <header className="hero-header">
+          <span className="eyebrow">{business?.name ?? "Sharma Dental Care"}</span>
+          <h1 className="headline">
+            Meet {agentName}.
+            <span className="headline-soft"> Your clinic&rsquo;s voice.</span>
+          </h1>
+          <p className="subhead">
+            An AI receptionist who books appointments, answers questions and speaks the way your
+            patients do.
+          </p>
+          <ul className="lang-chips" aria-label="Supported languages">
+            {languages.map((l) => (
+              <li key={l}>{l}</li>
+            ))}
+          </ul>
+        </header>
 
-      {errorMessage && <div className="error-banner">{errorMessage}</div>}
+        {errorMessage && (
+          <div className="error-banner" role="alert">
+            {errorMessage}
+          </div>
+        )}
 
-      <section className="card">
-        <div className="control-row">
-          {!isConnected ? (
-            <button className="primary" onClick={handleStart} disabled={isBusy}>
-              {isConnecting ? "Connecting…" : "Start Conversation"}
+        <section className="call-card" aria-label="Voice call">
+          <VoiceOrb state={agentState} initial={agentName.charAt(0)} />
+
+          <div className="call-state" aria-live="polite">
+            <span className={`state-label ${agentState}`}>{AGENT_STATE_LABEL[agentState]}</span>
+            <span className="call-timer">{isConnected ? formatElapsed(elapsed) : " "}</span>
+          </div>
+
+          <div className="call-actions">
+            {!isConnected ? (
+              <button className="btn btn-primary" onClick={handleStart} disabled={isBusy}>
+                <MicIcon />
+                {isConnecting ? "Connecting…" : "Start conversation"}
+              </button>
+            ) : (
+              <button className="btn btn-end" onClick={handleEnd} disabled={isEnding}>
+                <PhoneDownIcon />
+                {isEnding ? "Ending…" : "End conversation"}
+              </button>
+            )}
+            <button
+              className={`btn btn-secondary${chatOpen ? " active" : ""}`}
+              onClick={() => setChatOpen((o) => !o)}
+              aria-expanded={chatOpen}
+              aria-controls={CHAT_PANEL_ID}
+            >
+              <ChatIcon />
+              {chatOpen ? "Hide transcript" : "Transcript"}
+              {!chatOpen && unread > 0 && <span className="badge">{unread}</span>}
             </button>
-          ) : (
-            <button className="primary stop" onClick={handleEnd} disabled={isEnding}>
-              {isEnding ? "Ending…" : "End Conversation"}
-            </button>
-          )}
-          <span className={`agent-pill ${agentState}`}>{AGENT_STATE_LABEL[agentState]}</span>
-        </div>
-        <div className="status-line" style={{ marginTop: 16 }}>
-          <span className="status-item">
-            <span className={micDotClass} /> Microphone: {MIC_LABEL[micState]}
-          </span>
-          <span className="status-item">
-            <span className={connectionDotClass} /> Connection: {connectionState}
-          </span>
-          {callId && <span className="status-item">Call ID: {callId.slice(0, 8)}…</span>}
-        </div>
-      </section>
+          </div>
 
-      <section className="card">
-        <p className="section-title">Live Transcript</p>
-        <div className="transcript">
-          {transcript.length === 0 && (
-            <p className="transcript-empty">
-              Transcript will appear here once the conversation starts.
-            </p>
-          )}
-          {transcript.map((entry) => (
-            <div key={entry.id} className={`bubble-row ${entry.speaker}`}>
-              <div className={`bubble${entry.final ? "" : " interim"}`}>
-                <span className="speaker-label">{entry.speaker === "you" ? "You" : "Aisha"}</span>
-                {entry.text}
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {(extraction || waitingForResult) && (
-        <section className="card">
-          <p className="section-title">Call Result</p>
-          {waitingForResult && !extraction && (
-            <p className="transcript-empty">Processing call summary…</p>
-          )}
-          {extraction && (
-            <>
-              <span
-                className={`outcome-badge${extraction.outcome === "appointment_booked" ? " booked" : ""}`}
-              >
-                {(extraction.outcome ?? "unknown").replaceAll("_", " ")}
-              </span>
-              <div className="result-grid" style={{ marginTop: 16 }}>
-                <div className="result-field">
-                  <div className="label">Customer</div>
-                  <div className="value">{extraction.customer_name ?? "—"}</div>
-                </div>
-                <div className="result-field">
-                  <div className="label">Phone</div>
-                  <div className="value">{extraction.customer_phone ?? "—"}</div>
-                </div>
-                <div className="result-field">
-                  <div className="label">Service</div>
-                  <div className="value">{extraction.service ?? "—"}</div>
-                </div>
-                <div className="result-field">
-                  <div className="label">Language</div>
-                  <div className="value">{extraction.language ?? "—"}</div>
-                </div>
-                <div className="result-field">
-                  <div className="label">Date</div>
-                  <div className="value">{extraction.appointment_date ?? "—"}</div>
-                </div>
-                <div className="result-field">
-                  <div className="label">Time</div>
-                  <div className="value">{extraction.appointment_time ?? "—"}</div>
-                </div>
-              </div>
-              {extraction.summary && (
-                <div className="result-field" style={{ marginTop: 16 }}>
-                  <div className="label">Summary</div>
-                  <div className="value" style={{ fontWeight: 400 }}>
-                    {extraction.summary}
-                  </div>
-                </div>
-              )}
-            </>
-          )}
+          <div className="status-chips">
+            <span className={`chip ${micTone}`}>
+              <span className="dot" /> {MIC_LABEL[micState]}
+            </span>
+            <span className={`chip ${connectionTone}`}>
+              <span className="dot" /> {CONNECTION_LABEL[connectionState]}
+            </span>
+            {callId && <span className="chip mono">#{callId.slice(0, 8)}</span>}
+          </div>
         </section>
-      )}
 
-      <details className="debug card">
-        <summary>Debug log ({debugLog.length})</summary>
-        <div className="debug-log" ref={debugLogRef}>
-          {debugLog.length === 0 ? "No events yet." : debugLog.join("\n")}
-        </div>
-      </details>
+        {(extraction || waitingForResult) && (
+          <section className="result-card" aria-label="Call result">
+            <div className="result-head">
+              <h2 className="card-title">Call summary</h2>
+              {extraction && (
+                <span
+                  className={`outcome-badge${extraction.outcome === "appointment_booked" ? " booked" : ""}`}
+                >
+                  {(extraction.outcome ?? "unknown").replaceAll("_", " ")}
+                </span>
+              )}
+            </div>
+            {waitingForResult && !extraction && (
+              <p className="muted shimmer-text">Putting together the call summary…</p>
+            )}
+            {extraction && (
+              <>
+                {extraction.summary && <p className="result-summary">{extraction.summary}</p>}
+                <dl className="result-grid">
+                  {(
+                    [
+                      ["Customer", extraction.customer_name],
+                      ["Phone", extraction.customer_phone],
+                      ["Service", extraction.service],
+                      ["Language", extraction.language],
+                      ["Date", extraction.appointment_date],
+                      ["Time", extraction.appointment_time],
+                    ] as const
+                  ).map(([label, value]) => (
+                    <div key={label} className="result-field">
+                      <dt>{label}</dt>
+                      <dd>{value ?? "—"}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </>
+            )}
+          </section>
+        )}
 
-      <p className="footer-note">
-        V0 demo — fake business data. Not for real patient use. See README for architecture
-        and next steps.
-      </p>
-    </main>
+        <details className="debug">
+          <summary>
+            <ChevronIcon className="debug-chevron" width={14} height={14} />
+            Debug log <span className="muted">({debugLog.length})</span>
+          </summary>
+          <div className="debug-log" ref={debugLogRef}>
+            {debugLog.length === 0 ? "No events yet." : debugLog.join("\n")}
+          </div>
+        </details>
+
+        <p className="footer-note">
+          V0 demo · fake business data · not for real patient use
+        </p>
+      </main>
+
+      <div className="chat-scrim" onClick={() => setChatOpen(false)} aria-hidden />
+      <ChatPanel
+        id={CHAT_PANEL_ID}
+        open={chatOpen}
+        agentName={agentName}
+        agentState={agentState}
+        entries={transcript}
+        onClose={() => setChatOpen(false)}
+      />
+    </div>
   );
 }
