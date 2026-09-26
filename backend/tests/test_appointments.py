@@ -216,3 +216,84 @@ def test_book_appointment_is_idempotent_for_same_caller_and_slot(business_id):
             .count()
         )
     assert count == 1
+
+
+def _time_with_open_slots(business_id: str, needed: int) -> tuple[str, str, list[int]]:
+    """A (date, time) with at least `needed` open slots, plus those slot ids."""
+    today = date.today()
+    with session_scope() as session:
+        for offset in range(14):
+            d = (today + timedelta(days=offset)).isoformat()
+            slots = (
+                session.query(AppointmentSlot)
+                .filter(
+                    AppointmentSlot.business_id == business_id,
+                    AppointmentSlot.date == d,
+                    AppointmentSlot.is_booked.is_(False),
+                )
+                .all()
+            )
+            by_time: dict[str, list[int]] = {}
+            for s in slots:
+                by_time.setdefault(s.time, []).append(s.id)
+            for t, ids in sorted(by_time.items()):
+                if len(ids) >= needed:
+                    return d, t, ids
+    raise AssertionError(f"no time with {needed} open slots in the seeded window")
+
+
+def test_group_booking_books_each_person_on_a_shared_phone(business_id):
+    from app.tools.appointments import book_group_appointment
+
+    target_date, target_time, _ = _time_with_open_slots(business_id, 2)
+    kwargs = dict(
+        business_id=business_id,
+        customer_phone="9899700001",
+        patient_names=["Sunita Verma", "Aarav Verma"],
+        date=target_date,
+        time=target_time,
+        service="Dental cleaning",
+    )
+    with session_scope() as session:
+        result = book_group_appointment(session, **kwargs)
+
+    assert result["success"] is True
+    assert sorted(a["customer_name"] for a in result["appointments"]) == ["Aarav Verma", "Sunita Verma"]
+    assert len({a["doctor"] for a in result["appointments"]}) == 2
+
+    with session_scope() as session:
+        appts = session.query(Appointment).filter(Appointment.date == target_date, Appointment.time == target_time).all()
+        names = {a.customer.name for a in appts if a.customer.phone == "9899700001"}
+        assert names == {"Sunita Verma", "Aarav Verma"}
+
+    # Retrying the same group is idempotent, not a second pair of bookings.
+    with session_scope() as session:
+        retry = book_group_appointment(session, **kwargs)
+    assert retry["success"] is True
+    assert all(a.get("already_booked") for a in retry["appointments"])
+
+
+def test_group_booking_is_all_or_nothing(business_id):
+    from app.tools.appointments import book_group_appointment
+
+    target_date, target_time, open_ids = _time_with_open_slots(business_id, 1)
+    with session_scope() as session:
+        result = book_group_appointment(
+            session,
+            business_id=business_id,
+            customer_phone="9899700002",
+            patient_names=[f"Member {i}" for i in range(len(open_ids) + 1)],
+            date=target_date,
+            time=target_time,
+            service="Consultation",
+        )
+    assert result["success"] is False
+    assert "Nothing was booked" in result["error"]
+
+    with session_scope() as session:
+        still_open = (
+            session.query(AppointmentSlot)
+            .filter(AppointmentSlot.id.in_(open_ids), AppointmentSlot.is_booked.is_(False))
+            .count()
+        )
+    assert still_open == len(open_ids)

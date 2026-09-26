@@ -16,11 +16,11 @@ from __future__ import annotations
 from datetime import date as date_cls
 from datetime import datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.database.models import Appointment, AppointmentSlot, Business, Customer
-from app.tools.customer import get_or_create_customer
+from app.tools.customer import get_or_create_customer, get_or_create_household_member
 
 WEEKDAY_NAMES = [
     "monday",
@@ -201,6 +201,101 @@ def book_appointment(
     return _booking_result(appointment, customer.name)
 
 
+MAX_GROUP_SIZE = 4
+
+
+def book_group_appointment(
+    session: Session,
+    *,
+    business_id: str,
+    customer_phone: str,
+    patient_names: list[str],
+    date: str,
+    time: str,
+    service: str,
+) -> dict:
+    """Book several people (e.g. a parent and child) at the same date/time,
+    one slot each, all-or-nothing: if there aren't enough open slots for
+    everyone, nothing is booked and the caller can pick another time."""
+    try:
+        parsed_date = _parse_iso_date(date)
+        parsed_time = _parse_time(time)
+    except InvalidDateError as exc:
+        return {"success": False, "error": str(exc)}
+
+    names: list[str] = []
+    for raw in patient_names:
+        name = raw.strip()
+        if name and name.lower() not in {n.lower() for n in names}:
+            names.append(name)
+    if not names:
+        return {"success": False, "error": "No patient names given."}
+    if len(names) > MAX_GROUP_SIZE:
+        return {"success": False, "error": f"At most {MAX_GROUP_SIZE} people can be booked together."}
+
+    iso_date = parsed_date.isoformat()
+    booked: list[dict] = []
+    pending: list[str] = []
+    for name in names:
+        existing = _find_existing_booking(
+            session,
+            business_id=business_id,
+            customer_phone=customer_phone,
+            date=iso_date,
+            time=parsed_time,
+            customer_name=name,
+        )
+        if existing is not None:
+            booked.append(_booking_result(existing, existing.customer.name, already_booked=True))
+        else:
+            pending.append(name)
+
+    claimed: list[AppointmentSlot] = []
+    for candidate in _find_candidate_slots(
+        session, business_id=business_id, date=iso_date, time=parsed_time, doctor=None
+    ):
+        if len(claimed) == len(pending):
+            break
+        if _claim_slot(session, candidate.id):
+            claimed.append(candidate)
+
+    if len(claimed) < len(pending):
+        if claimed:
+            session.execute(
+                update(AppointmentSlot)
+                .where(AppointmentSlot.id.in_([slot.id for slot in claimed]))
+                .values(is_booked=False)
+                .execution_options(synchronize_session=False)
+            )
+        return {
+            "success": False,
+            "error": (
+                f"Only {len(claimed)} open slot(s) on {iso_date} at {parsed_time}, "
+                f"but {len(pending)} needed. Nothing was booked. Offer another time, "
+                "or book them at back-to-back times with book_appointment."
+            ),
+        }
+
+    for name, slot in zip(pending, claimed):
+        customer = get_or_create_household_member(
+            session, business_id=business_id, name=name, phone=customer_phone
+        )
+        appointment = Appointment(
+            business_id=business_id,
+            customer_id=customer.id,
+            date=iso_date,
+            time=parsed_time,
+            service=service,
+            doctor=slot.doctor,
+            status="confirmed",
+        )
+        session.add(appointment)
+        session.flush()
+        booked.append(_booking_result(appointment, customer.name))
+
+    return {"success": True, "date": iso_date, "time": parsed_time, "appointments": booked}
+
+
 def _booking_result(appointment: Appointment, customer_name: str, *, already_booked: bool = False) -> dict:
     result = {
         "success": True,
@@ -217,11 +312,17 @@ def _booking_result(appointment: Appointment, customer_name: str, *, already_boo
 
 
 def _find_existing_booking(
-    session: Session, *, business_id: str, customer_phone: str | None, date: str, time: str
+    session: Session,
+    *,
+    business_id: str,
+    customer_phone: str | None,
+    date: str,
+    time: str,
+    customer_name: str | None = None,
 ) -> Appointment | None:
     if not customer_phone:
         return None
-    return session.execute(
+    query = (
         select(Appointment)
         .join(Customer, Appointment.customer_id == Customer.id)
         .where(
@@ -231,8 +332,12 @@ def _find_existing_booking(
             Appointment.status == "confirmed",
             Customer.phone == customer_phone,
         )
-        .limit(1)
-    ).scalar_one_or_none()
+    )
+    if customer_name:
+        # Household bookings share a phone, so the name tells retries apart
+        # from a second family member at the same time.
+        query = query.where(func.lower(Customer.name) == customer_name.strip().lower())
+    return session.execute(query.limit(1)).scalar_one_or_none()
 
 
 def _find_candidate_slots(

@@ -69,3 +69,47 @@ def test_sunday_has_no_slots(business_id):
             .count()
         )
         assert count == 0
+
+
+def test_ensure_availability_tops_up_expired_window_without_touching_bookings(business_id):
+    from datetime import date, timedelta
+
+    from app.database.database import session_scope
+    from app.database.models import AppointmentSlot
+    from app.database.seed import AVAILABILITY_DAYS, ensure_availability
+
+    # Simulate a seed that has aged: the last few days of the window have no slots.
+    tail = [(date.today() + timedelta(days=d)).isoformat() for d in range(AVAILABILITY_DAYS - 3, AVAILABILITY_DAYS)]
+    with session_scope() as session:
+        session.query(AppointmentSlot).filter(
+            AppointmentSlot.business_id == business_id, AppointmentSlot.date.in_(tail)
+        ).delete(synchronize_session=False)
+        booked_before = (
+            session.query(AppointmentSlot)
+            .filter(AppointmentSlot.business_id == business_id, AppointmentSlot.is_booked.is_(True))
+            .count()
+        )
+
+    with session_scope() as session:
+        assert ensure_availability(session, business_id) > 0
+
+    with session_scope() as session:
+        open_days = {
+            d
+            for (d,) in session.query(AppointmentSlot.date)
+            .filter(AppointmentSlot.business_id == business_id, AppointmentSlot.date.in_(tail))
+            .distinct()
+        }
+        assert open_days == {d for d in tail if date.fromisoformat(d).weekday() != 6}
+        # A second run is a no-op.
+        assert ensure_availability(session, business_id) == 0
+        booked_after = (
+            session.query(AppointmentSlot)
+            .filter(
+                AppointmentSlot.business_id == business_id,
+                AppointmentSlot.is_booked.is_(True),
+                AppointmentSlot.date.notin_(tail),
+            )
+            .count()
+        )
+    assert booked_after <= booked_before

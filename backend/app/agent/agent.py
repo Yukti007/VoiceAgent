@@ -69,6 +69,7 @@ from app.agent import session as call_session  # noqa: E402
 from app.agent.prompts import build_system_prompt  # noqa: E402
 from app.agent.state import SessionData  # noqa: E402
 from app.business.service import BusinessNotFoundError, render_business_knowledge  # noqa: E402
+from app.database.seed import ensure_availability  # noqa: E402
 from app.llm.provider import get_agent_llm_with_fallback  # noqa: E402
 from app.postcall.extractor import run_post_call_extraction  # noqa: E402
 from app.tools import appointments as appointment_tools  # noqa: E402
@@ -190,6 +191,55 @@ class Assistant(Agent):
         return result
 
     @function_tool()
+    async def book_group_appointment(
+        self,
+        context: RunContext[SessionData],
+        patient_names: list[str],
+        customer_phone: str,
+        date: str,
+        time: str,
+        service: str,
+    ) -> dict:
+        """Book the same date and time for several people at once, e.g. a caller and
+        their child. Use instead of book_appointment whenever more than one person
+        needs an appointment. Books everyone or no one.
+
+        Args:
+            patient_names: Full name of each person to book, including the caller if
+                they are one of the patients.
+            customer_phone: Contact phone number shared by the group.
+            date: ISO date YYYY-MM-DD.
+            time: 24-hour time HH:MM.
+            service: Service being booked, e.g. "Teeth cleaning".
+        """
+        try:
+            context.disallow_interruptions()
+        except RuntimeError:
+            return {
+                "success": False,
+                "error": "Not booked: the caller interrupted. Confirm the details with them again.",
+            }
+
+        business_id = context.userdata.business_id
+
+        def _book() -> dict:
+            with session_scope() as session:
+                return appointment_tools.book_group_appointment(
+                    session,
+                    business_id=business_id,
+                    customer_phone=customer_phone,
+                    patient_names=patient_names,
+                    date=date,
+                    time=time,
+                    service=service,
+                )
+
+        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
+            result = await asyncio.to_thread(_book)
+        logger.info("[tool] book_group_appointment(%s) -> %s", patient_names, result)
+        return result
+
+    @function_tool()
     async def get_business_hours(
         self, context: RunContext[SessionData], day: str | None = None
     ) -> dict:
@@ -270,15 +320,24 @@ def prewarm(proc: JobProcess) -> None:
     proc.userdata["storage_ready"] = True
 
 
-def _load_business_config(business_id: str) -> tuple[str, str, str]:
+def _load_business_config(business_id: str) -> tuple[str, str, str, str]:
     """Sync DB read of everything the session needs up front: (system prompt,
-    greeting, agent name). Run via `asyncio.to_thread` from the entrypoint."""
+    greeting, agent name, STT vocabulary hint). Run via `asyncio.to_thread`
+    from the entrypoint."""
     with session_scope() as session:
         business = session.get(Business, business_id)
         if business is None:
             raise BusinessNotFoundError(f"No business with id={business_id!r}")
+        ensure_availability(session, business_id)
         instructions = build_system_prompt(business, render_business_knowledge(business))
-        return instructions, business.greeting, business.agent_name
+        # Sarvam's realtime STT takes a `prompt` that biases decoding toward words
+        # it has no prior on: a live call heard "Hi Aisha" as "I'm Ayesha".
+        knowledge = business.business_knowledge or {}
+        service_names = [s.get("name") for s in knowledge.get("services", []) if s.get("name")]
+        vocabulary_hint = ", ".join(
+            [business.agent_name, business.name, *knowledge.get("doctors", []), *service_names]
+        )
+        return instructions, business.greeting, business.agent_name, vocabulary_hint
 
 
 def _init_storage() -> None:
@@ -352,7 +411,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # multi-hundred-ms stalls from synchronous work here.
     if not ctx.proc.userdata.get("storage_ready"):
         await asyncio.to_thread(_init_storage)
-    (instructions, greeting, agent_name), _ = await asyncio.gather(
+    (instructions, greeting, agent_name, stt_vocabulary_hint), _ = await asyncio.gather(
         asyncio.to_thread(_load_business_config, business_id),
         ctx.connect(),
     )
@@ -391,6 +450,7 @@ async def entrypoint(ctx: JobContext) -> None:
             # script choice.
             mode="transcribe",
             sample_rate=AUDIO_SAMPLE_RATE_IN,
+            prompt=stt_vocabulary_hint,
         ),
         llm=get_agent_llm_with_fallback(settings),
         tts=sarvam.TTS(
@@ -550,10 +610,16 @@ async def _say_greeting(session: AgentSession, greeting: str, settings) -> None:
     cached = await asyncio.to_thread(audio_cache.load, key)
     if cached is not None:
         pcm, sample_rate, num_channels = cached
-        session.say(greeting, audio=audio_cache.frames_from_pcm(pcm, sample_rate, num_channels))
+        session.say(
+            greeting,
+            audio=audio_cache.frames_from_pcm(pcm, sample_rate, num_channels),
+            allow_interruptions=False,
+        )
         return
 
-    handle = session.say(greeting)
+    # Not interruptible: background noise or an "hello?" in the first second
+    # used to cancel the greeting outright, leaving the caller in silence.
+    handle = session.say(greeting, allow_interruptions=False)
 
     async def _warm_cache() -> None:
         # After the live greeting has played, so the extra synthesis never

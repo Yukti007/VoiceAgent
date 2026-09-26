@@ -27,6 +27,19 @@ class CallExtraction(BaseModel):
     requires_followup: bool = False
     summary: str
 
+    @field_validator("intent", "language", "outcome", mode="before")
+    @classmethod
+    def _default_unknown(cls, v: object) -> object:
+        # Short or silent calls give the LLM nothing to infer these from, and it
+        # returns null -- which used to fail validation and drop the whole
+        # extraction, summary included.
+        return "unknown" if v is None or v == "" else v
+
+    @field_validator("summary", mode="before")
+    @classmethod
+    def _default_summary(cls, v: object) -> object:
+        return "" if v is None else v
+
     @field_validator("appointment_date")
     @classmethod
     def _validate_date(cls, v: str | None) -> str | None:
