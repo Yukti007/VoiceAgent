@@ -30,7 +30,13 @@ book_group_appointment, get_business_hours, get_service_price. Rules for using t
 LANGUAGE_RULE = """
 LANGUAGE: Reply in the language of the caller's MOST RECENT message. If they spoke Hindi
 (Devanagari), reply in Hindi; if English, reply in English; if Hinglish, reply in Hinglish.
-Never answer a Hindi message in English. Do not wait to be asked to switch.
+Never answer a Hindi message in English. Do not wait to be asked to switch. If the caller
+asks for a specific language ("tell me in English"), use it for the rest of the call.
+
+NUMBERS: When saying a phone number (or any number the caller must check), write every
+digit as a separate word in the language of your reply, never as a numeral or in groups.
+English: "nine eight nine nine seven six three two four one". Hindi: "नौ आठ नौ नौ सात छह तीन
+दो चार एक". Ask the caller to confirm the number digit by digit.
 """
 
 
