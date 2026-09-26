@@ -8,6 +8,7 @@ even if extraction breaks (bad JSON, LLM outage, etc.).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -51,10 +52,11 @@ def _format_transcript(messages: list[CallMessage]) -> str:
     return "\n".join(lines)
 
 
-async def run_post_call_extraction(call_id: str) -> CallExtraction | None:
-    """Extract + validate + persist. Returns the validated extraction, or None
-    if extraction could not be completed (already logged)."""
-
+def _load_transcript(call_id: str) -> str | None:
+    """Synchronous SQLAlchemy read+commit -- run via asyncio.to_thread by the
+    caller so this doesn't block the agent worker's event loop the same way
+    the call-lifecycle writes in app/agent/session.py did (see the to_thread
+    comments in app/agent/agent.py's entrypoint for the measured cost)."""
     with session_scope() as session:
         call = session.get(Call, call_id)
         if call is None:
@@ -68,31 +70,16 @@ async def run_post_call_extraction(call_id: str) -> CallExtraction | None:
             .scalars()
             .all()
         )
-        transcript = _format_transcript(messages)
+        return _format_transcript(messages)
 
-    if not transcript.strip():
-        logger.warning("post-call extraction: call %s has no messages, skipping", call_id)
-        return None
 
-    try:
-        provider = get_llm_provider()
-        raw = await provider.complete_json(
-            system=EXTRACTION_SYSTEM_PROMPT,
-            user=f"Transcript:\n\n{transcript}",
-        )
-        data = json.loads(raw)
-        extraction = CallExtraction.model_validate(data)
-    except (json.JSONDecodeError, ValidationError) as exc:
-        logger.error("post-call extraction: invalid LLM output for call %s: %s", call_id, exc)
-        return None
-    except Exception as exc:  # LLM/network failure -- never crash the app over this
-        logger.error("post-call extraction: LLM call failed for call %s: %s", call_id, exc)
-        return None
-
+def _store_extraction(call_id: str, extraction: CallExtraction) -> None:
+    """Synchronous SQLAlchemy write+commit -- see _load_transcript above for
+    why the caller offloads this to a worker thread."""
     with session_scope() as session:
         call = session.get(Call, call_id)
         if call is None:
-            return extraction
+            return
 
         existing = session.execute(
             select(CallExtractionRow).where(CallExtractionRow.call_id == call_id)
@@ -119,4 +106,33 @@ async def run_post_call_extraction(call_id: str) -> CallExtraction | None:
 
         logger.info("post-call extraction stored for call %s: outcome=%s", call_id, extraction.outcome)
 
+
+async def run_post_call_extraction(call_id: str) -> CallExtraction | None:
+    """Extract + validate + persist. Returns the validated extraction, or None
+    if extraction could not be completed (already logged)."""
+
+    transcript = await asyncio.to_thread(_load_transcript, call_id)
+    if transcript is None:
+        return None
+
+    if not transcript.strip():
+        logger.warning("post-call extraction: call %s has no messages, skipping", call_id)
+        return None
+
+    try:
+        provider = get_llm_provider()
+        raw = await provider.complete_json(
+            system=EXTRACTION_SYSTEM_PROMPT,
+            user=f"Transcript:\n\n{transcript}",
+        )
+        data = json.loads(raw)
+        extraction = CallExtraction.model_validate(data)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        logger.error("post-call extraction: invalid LLM output for call %s: %s", call_id, exc)
+        return None
+    except Exception as exc:  # LLM/network failure -- never crash the app over this
+        logger.error("post-call extraction: LLM call failed for call %s: %s", call_id, exc)
+        return None
+
+    await asyncio.to_thread(_store_extraction, call_id, extraction)
     return extraction

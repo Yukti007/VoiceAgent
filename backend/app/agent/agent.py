@@ -69,6 +69,7 @@ from app.agent import session as call_session  # noqa: E402
 from app.agent.prompts import build_system_prompt  # noqa: E402
 from app.agent.state import SessionData  # noqa: E402
 from app.business.service import BusinessNotFoundError, render_business_knowledge  # noqa: E402
+from app.database.seed import ensure_availability  # noqa: E402
 from app.llm.provider import get_agent_llm_with_fallback  # noqa: E402
 from app.postcall.extractor import run_post_call_extraction  # noqa: E402
 from app.tools import appointments as appointment_tools  # noqa: E402
@@ -190,6 +191,55 @@ class Assistant(Agent):
         return result
 
     @function_tool()
+    async def book_group_appointment(
+        self,
+        context: RunContext[SessionData],
+        patient_names: list[str],
+        customer_phone: str,
+        date: str,
+        time: str,
+        service: str,
+    ) -> dict:
+        """Book the same date and time for several people at once, e.g. a caller and
+        their child. Use instead of book_appointment whenever more than one person
+        needs an appointment. Books everyone or no one.
+
+        Args:
+            patient_names: Full name of each person to book, including the caller if
+                they are one of the patients.
+            customer_phone: Contact phone number shared by the group.
+            date: ISO date YYYY-MM-DD.
+            time: 24-hour time HH:MM.
+            service: Service being booked, e.g. "Teeth cleaning".
+        """
+        try:
+            context.disallow_interruptions()
+        except RuntimeError:
+            return {
+                "success": False,
+                "error": "Not booked: the caller interrupted. Confirm the details with them again.",
+            }
+
+        business_id = context.userdata.business_id
+
+        def _book() -> dict:
+            with session_scope() as session:
+                return appointment_tools.book_group_appointment(
+                    session,
+                    business_id=business_id,
+                    customer_phone=customer_phone,
+                    patient_names=patient_names,
+                    date=date,
+                    time=time,
+                    service=service,
+                )
+
+        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
+            result = await asyncio.to_thread(_book)
+        logger.info("[tool] book_group_appointment(%s) -> %s", patient_names, result)
+        return result
+
+    @function_tool()
     async def get_business_hours(
         self, context: RunContext[SessionData], day: str | None = None
     ) -> dict:
@@ -238,6 +288,22 @@ def prewarm(proc: JobProcess) -> None:
     # sample_rate matches AUDIO_SAMPLE_RATE_IN -- see the comment above it.
     proc.userdata["vad"] = silero.VAD.load(sample_rate=AUDIO_SAMPLE_RATE_IN)
 
+    # Two lazy-import stalls measured live, both moved here so they land during
+    # process warm-up instead of during a real call's first turn:
+    # 1. livekit-plugins-openai's LLM (used for BOTH the "openai" and "groq"
+    #    providers -- see app/llm/provider.py, Groq just points the same
+    #    plugin at a different base_url) prewarms itself via client.models.list(),
+    #    which on first use imports openai's `resources.beta.chatkit` submodule
+    #    tree -- measured at ~2.9s blocking the asyncio event loop.
+    # 2. Constructing any AsyncOpenAI client (e.g. GroqProvider's own client for
+    #    post-call extraction, in get_llm_provider() below) imports httpcore's
+    #    sync backend the first time -- measured at ~0.5s.
+    # Both block audio/turn handling for their whole duration wherever they land;
+    # importing them up front makes that a one-time per-process cost instead of
+    # a per-call one.
+    import httpcore  # noqa: F401
+    import openai.resources.beta.chatkit.chatkit  # noqa: F401
+
     # The openai SDK imports most of its type modules lazily, on first use.
     # agent_worker.log showed that first use happening mid-call, on the event
     # loop ("event loop blocked for 1996ms importing openai.types.beta..."),
@@ -254,15 +320,24 @@ def prewarm(proc: JobProcess) -> None:
     proc.userdata["storage_ready"] = True
 
 
-def _load_business_config(business_id: str) -> tuple[str, str, str]:
+def _load_business_config(business_id: str) -> tuple[str, str, str, str]:
     """Sync DB read of everything the session needs up front: (system prompt,
-    greeting, agent name). Run via `asyncio.to_thread` from the entrypoint."""
+    greeting, agent name, STT vocabulary hint). Run via `asyncio.to_thread`
+    from the entrypoint."""
     with session_scope() as session:
         business = session.get(Business, business_id)
         if business is None:
             raise BusinessNotFoundError(f"No business with id={business_id!r}")
+        ensure_availability(session, business_id)
         instructions = build_system_prompt(business, render_business_knowledge(business))
-        return instructions, business.greeting, business.agent_name
+        # Sarvam's realtime STT takes a `prompt` that biases decoding toward words
+        # it has no prior on: a live call heard "Hi Aisha" as "I'm Ayesha".
+        knowledge = business.business_knowledge or {}
+        service_names = [s.get("name") for s in knowledge.get("services", []) if s.get("name")]
+        vocabulary_hint = ", ".join(
+            [business.agent_name, business.name, *knowledge.get("doctors", []), *service_names]
+        )
+        return instructions, business.greeting, business.agent_name, vocabulary_hint
 
 
 def _init_storage() -> None:
@@ -336,7 +411,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # multi-hundred-ms stalls from synchronous work here.
     if not ctx.proc.userdata.get("storage_ready"):
         await asyncio.to_thread(_init_storage)
-    (instructions, greeting, agent_name), _ = await asyncio.gather(
+    (instructions, greeting, agent_name, stt_vocabulary_hint), _ = await asyncio.gather(
         asyncio.to_thread(_load_business_config, business_id),
         ctx.connect(),
     )
@@ -349,9 +424,33 @@ async def entrypoint(ctx: JobContext) -> None:
         userdata=SessionData(business_id=business_id, call_id=call_id, room_name=ctx.room.name),
         stt=sarvam.STTRealtime(
             api_key=settings.sarvam_api_key,
+            # `language` was previously pinned to a fixed BCP-47 code (hi-IN), which
+            # doesn't just set a *default* -- it forces Sarvam to decode every
+            # utterance through that language's model. A pinned "hi-IN" was
+            # confirmed live to mis-transcribe/drop words in English speech (being
+            # decoded through a Hindi acoustic/language model) and to report every
+            # utterance's language as "hi" regardless of what was actually said --
+            # which then fed a Hindi (or garbled) transcript to the LLM, whose
+            # "reply in the caller's language" instruction faithfully mirrored that
+            # mistake back in Hindi even when the caller spoke English. `"auto"` is
+            # a first-class value here (see livekit-plugins-sarvam's
+            # RealtimeSTTOptions.language / SUPPORTED_LANGUAGES) that runs Sarvam's
+            # own per-utterance language identification instead, so English and
+            # Hindi/Hinglish speech are each decoded through their own model and
+            # `ev.language` on user_input_transcribed reports what was actually
+            # detected -- which is also what the TTS-retargeting handler below
+            # already relies on.
             language=settings.sarvam_stt_language,
-            mode="codemix",  # Hindi/English code-switching, e.g. Hinglish
+            # "codemix" was separately confirmed to render pure-English utterances
+            # as Devanagari-script phonetic transliteration (e.g. "Hi Aisha, how are
+            # you?" -> "हाय आयशा, हाउ आर यू?") even independent of the language-pin
+            # issue above. "transcribe" is standard transcription in the language
+            # actually spoken/detected, which is what we want; "codemix" is for
+            # genuinely mixed Hindi/English *within one utterance*, not a wholesale
+            # script choice.
+            mode="transcribe",
             sample_rate=AUDIO_SAMPLE_RATE_IN,
+            prompt=stt_vocabulary_hint,
         ),
         llm=get_agent_llm_with_fallback(settings),
         tts=sarvam.TTS(
@@ -360,6 +459,16 @@ async def entrypoint(ctx: JobContext) -> None:
             speaker=settings.sarvam_tts_speaker,
             speech_sample_rate=AUDIO_SAMPLE_RATE_OUT,
         ),
+        # `vad` still gates raw speech/silence framing (and is required by the STT/TTS
+        # provider interfaces below), but deliberately NOT passed as `turn_detection`:
+        # livekit-agents 1.8's default turn detector is a semantic end-of-turn model
+        # (inference.TurnDetector, per-language thresholds incl. "hi") that judges
+        # whether a pause is really turn-final instead of just timing raw silence.
+        # Forcing turn_detection="vad" (the previous config) disables that model and
+        # falls back to a fixed silence timeout -- worse latency on confident turn
+        # ends AND more false interruptions on mid-sentence pauses, which are exactly
+        # this demo's two headline risks for Hindi/Hinglish speech. Leaving
+        # `turn_detection` unset lets AgentSession pick that smart default.
         vad=ctx.proc.userdata["vad"],
         turn_handling=_build_turn_handling(settings),
         conn_options=SESSION_CONN_OPTIONS,
@@ -367,10 +476,28 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # ---- Debug/demo logging: transcript, tool calls, latency metrics, turns ----
 
+    # Bulbul's target_language_code is set once at TTS construction (hi-IN, above)
+    # but the caller's actual language varies turn by turn -- a real test call
+    # showed Bulbul mispronouncing plain English words ("I'm" -> "Im", "Wednesday")
+    # when synthesizing an English reply under a Hindi target. Sarvam's realtime STT
+    # reports a detected `language` per final transcript (already logged below);
+    # retarget the TTS to match it before the next reply is generated, using
+    # sarvam.TTS.update_options (a real runtime API, not a full reconnect). Only
+    # "en" and "hi" are mapped since that's this demo's supported range -- anything
+    # else (misdetection, silence) is left on whatever language is already active
+    # rather than guessed at.
+    _stt_lang_to_tts_target = {"en": "en-IN", "hi": "hi-IN"}
+    _last_tts_target = {"value": settings.sarvam_tts_language}
+
     @session.on("user_input_transcribed")
     def _on_user_transcribed(ev) -> None:
         if ev.is_final:
             logger.info("[call %s] STT final: %r (lang=%s)", call_id, ev.transcript, ev.language)
+            target = ev.language and _stt_lang_to_tts_target.get(ev.language.language)
+            if target and target != _last_tts_target["value"]:
+                _last_tts_target["value"] = target
+                session.tts.update_options(target_language_code=target)
+                logger.info("[call %s] TTS target_language_code -> %s", call_id, target)
 
     @session.on("conversation_item_added")
     def _on_item_added(ev) -> None:
@@ -483,10 +610,16 @@ async def _say_greeting(session: AgentSession, greeting: str, settings) -> None:
     cached = await asyncio.to_thread(audio_cache.load, key)
     if cached is not None:
         pcm, sample_rate, num_channels = cached
-        session.say(greeting, audio=audio_cache.frames_from_pcm(pcm, sample_rate, num_channels))
+        session.say(
+            greeting,
+            audio=audio_cache.frames_from_pcm(pcm, sample_rate, num_channels),
+            allow_interruptions=False,
+        )
         return
 
-    handle = session.say(greeting)
+    # Not interruptible: background noise or an "hello?" in the first second
+    # used to cancel the greeting outright, leaving the caller in silence.
+    handle = session.say(greeting, allow_interruptions=False)
 
     async def _warm_cache() -> None:
         # After the live greeting has played, so the extra synthesis never

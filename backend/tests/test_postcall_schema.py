@@ -60,3 +60,14 @@ def test_missing_optional_fields_default_sensibly():
     )
     assert extraction.customer_name is None
     assert extraction.requires_followup is False
+
+
+def test_null_required_fields_fall_back_instead_of_failing():
+    # A short call once produced language=null, which dropped the whole extraction.
+    extraction = CallExtraction.model_validate(
+        {"intent": None, "language": None, "outcome": "", "summary": None}
+    )
+    assert extraction.intent == "unknown"
+    assert extraction.language == "unknown"
+    assert extraction.outcome == "unknown"
+    assert extraction.summary == ""

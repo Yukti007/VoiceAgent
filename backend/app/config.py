@@ -46,7 +46,10 @@ class Settings(BaseSettings):
 
     # --- Sarvam AI (STT: Saaras realtime, TTS: Bulbul streaming) ---
     sarvam_api_key: str = Field(default="YOUR_SARVAM_API_KEY", alias="SARVAM_API_KEY")
-    sarvam_stt_language: str = Field(default="hi-IN", alias="SARVAM_STT_LANGUAGE")
+    # "auto" runs Sarvam's own per-utterance language identification instead of
+    # pinning every utterance to one language -- see the STTRealtime construction
+    # in app/agent/agent.py for why a fixed code caused mis-transcription.
+    sarvam_stt_language: str = Field(default="auto", alias="SARVAM_STT_LANGUAGE")
     sarvam_tts_language: str = Field(default="hi-IN", alias="SARVAM_TTS_LANGUAGE")
     sarvam_tts_speaker: str = Field(default="pooja", alias="SARVAM_TTS_SPEAKER")
     # Used only when LLM_PROVIDER=sarvam -- reuses SARVAM_API_KEY, no separate credential.

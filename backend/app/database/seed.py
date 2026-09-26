@@ -111,29 +111,56 @@ def _generate_slots_for_business(session, business_id: str) -> int:
 
     rng = random.Random(RNG_SEED)
     today = date.today()
-    created = 0
+    return sum(
+        _add_slots_for_day(session, business_id, today + timedelta(days=offset), rng)
+        for offset in range(AVAILABILITY_DAYS)
+    )
 
-    for offset in range(AVAILABILITY_DAYS):
-        day = today + timedelta(days=offset)
-        hours = HOURS_BY_WEEKDAY[day.weekday()]
-        if hours is None:
-            continue  # closed (Sunday)
-        open_hour, close_hour = hours
-        # Last bookable start time is one hour before close.
-        for hour in range(open_hour, close_hour):
-            time_str = f"{hour:02d}:00"
-            for doctor in DOCTORS:
-                is_booked = rng.random() < 0.25  # ~25% of slots pre-booked, for realism
-                session.add(
-                    AppointmentSlot(
-                        business_id=business_id,
-                        doctor=doctor,
-                        date=day.isoformat(),
-                        time=time_str,
-                        is_booked=is_booked,
-                    )
+
+def _add_slots_for_day(session, business_id: str, day: date, rng: random.Random) -> int:
+    hours = HOURS_BY_WEEKDAY[day.weekday()]
+    if hours is None:
+        return 0  # closed (Sunday)
+    open_hour, close_hour = hours
+    created = 0
+    # Last bookable start time is one hour before close.
+    for hour in range(open_hour, close_hour):
+        time_str = f"{hour:02d}:00"
+        for doctor in DOCTORS:
+            is_booked = rng.random() < 0.25  # ~25% of slots pre-booked, for realism
+            session.add(
+                AppointmentSlot(
+                    business_id=business_id,
+                    doctor=doctor,
+                    date=day.isoformat(),
+                    time=time_str,
+                    is_booked=is_booked,
                 )
-                created += 1
+            )
+            created += 1
+    return created
+
+
+def ensure_availability(session, business_id: str) -> int:
+    """Top up the rolling AVAILABILITY_DAYS window without touching existing
+    slots or bookings. The one-off seed only covers the 14 days after it ran,
+    so without this every date past that silently became unbookable."""
+    today = date.today()
+    window = [(today + timedelta(days=offset)).isoformat() for offset in range(AVAILABILITY_DAYS)]
+    covered = {
+        d
+        for (d,) in session.query(AppointmentSlot.date)
+        .filter(AppointmentSlot.business_id == business_id, AppointmentSlot.date.in_(window))
+        .distinct()
+    }
+    created = 0
+    for iso_day in window:
+        if iso_day in covered:
+            continue
+        day = date.fromisoformat(iso_day)
+        created += _add_slots_for_day(session, business_id, day, random.Random(f"{RNG_SEED}:{iso_day}"))
+    if created:
+        logger.info("Topped up %d appointment slots for %s", created, business_id)
     return created
 
 
