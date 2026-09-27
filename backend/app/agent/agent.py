@@ -12,6 +12,7 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import sys
 from collections.abc import AsyncIterable, AsyncIterator
@@ -46,7 +47,8 @@ from livekit.agents import (  # noqa: E402
     function_tool,
     room_io,
 )
-from livekit.agents import inference  # noqa: E402
+from livekit.agents import inference, tokenize  # noqa: E402
+from livekit.agents.tokenize import _basic_sent, token_stream  # noqa: E402
 from livekit.agents.voice.agent_session import SessionConnectOptions  # noqa: E402
 from livekit.plugins import noise_cancellation, sarvam, silero  # noqa: E402
 
@@ -105,6 +107,10 @@ SESSION_CONN_OPTIONS = SessionConnectOptions(
 # How much of a reply to read before choosing the TTS language for it.
 _TTS_LANGUAGE_PEEK_LETTERS = 12
 
+# Sentence chunking for streaming TTS (framework defaults: 20 / 10 chars).
+_TTS_MIN_SENTENCE_LEN = 8
+_TTS_CONTEXT_LEN = 4
+
 
 def tts_language_for(text: str) -> str | None:
     """Bulbul target language for a reply, from its script: Devanagari ->
@@ -114,6 +120,43 @@ def tts_language_for(text: str) -> str | None:
         return None
     devanagari = sum(1 for c in letters if "ऀ" <= c <= "ॿ")
     return "hi-IN" if devanagari * 2 >= len(letters) else "en-IN"
+
+
+def _split_sentences_indic(
+    text: str, min_sentence_len: int = 20, retain_format: bool = False
+) -> list[tuple[str, int, int]]:
+    """LiveKit's basic splitter, taught that the Devanagari danda ends a sentence.
+
+    It only knows . ! ? and the CJK full stops, so a Hindi reply ending its
+    sentences with "।" was one unbroken "sentence": TTS got nothing until the
+    LLM had finished the whole reply, and audio trailed the transcript by
+    seconds. Swap danda for "。" (same length, so offsets hold) and back."""
+    swapped = text.replace("।", "。").replace("॥", "。")
+    return [
+        (sentence.replace("。", "।"), start, end)
+        for sentence, start, end in _basic_sent.split_sentences(
+            swapped, min_sentence_len=min_sentence_len, retain_format=retain_format
+        )
+    ]
+
+
+class IndicSentenceTokenizer(tokenize.basic.SentenceTokenizer):
+    """Sentence tokenizer for Bulbul's streaming input: splits on danda too,
+    and flushes short first sentences ("बहुत अच्छा!") instead of holding them
+    back to merge with the next one."""
+
+    def __init__(self) -> None:
+        super().__init__(min_sentence_len=_TTS_MIN_SENTENCE_LEN, stream_context_len=_TTS_CONTEXT_LEN)
+
+    def tokenize(self, text: str, *, language: str | None = None) -> list[str]:
+        return [s for s, _, _ in _split_sentences_indic(text, _TTS_MIN_SENTENCE_LEN)]
+
+    def stream(self, *, language: str | None = None) -> tokenize.SentenceStream:
+        return token_stream.BufferedSentenceStream(
+            tokenizer=functools.partial(_split_sentences_indic, min_sentence_len=_TTS_MIN_SENTENCE_LEN),
+            min_token_len=_TTS_MIN_SENTENCE_LEN,
+            min_ctx_len=_TTS_CONTEXT_LEN,
+        )
 
 
 class Assistant(Agent):
@@ -467,6 +510,15 @@ async def entrypoint(ctx: JobContext) -> None:
     message_writer = call_session.CallMessageWriter(call_id)
     logger.info("[call %s] starting session for room=%s agent=%s", call_id, ctx.room.name, agent_name)
 
+    tts = sarvam.TTS(
+        api_key=settings.sarvam_api_key,
+        target_language_code=settings.sarvam_tts_language,
+        speaker=settings.sarvam_tts_speaker,
+        speech_sample_rate=AUDIO_SAMPLE_RATE_OUT,
+    )
+    # The plugin's constructor doesn't take a tokenizer; see IndicSentenceTokenizer.
+    tts._opts.word_tokenizer = IndicSentenceTokenizer()
+
     session: AgentSession[SessionData] = AgentSession[SessionData](
         userdata=SessionData(business_id=business_id, call_id=call_id, room_name=ctx.room.name),
         stt=sarvam.STTRealtime(
@@ -500,12 +552,7 @@ async def entrypoint(ctx: JobContext) -> None:
             prompt=stt_vocabulary_hint,
         ),
         llm=get_agent_llm_with_fallback(settings),
-        tts=sarvam.TTS(
-            api_key=settings.sarvam_api_key,
-            target_language_code=settings.sarvam_tts_language,
-            speaker=settings.sarvam_tts_speaker,
-            speech_sample_rate=AUDIO_SAMPLE_RATE_OUT,
-        ),
+        tts=tts,
         # `vad` still gates raw speech/silence framing (and is required by the STT/TTS
         # provider interfaces below), but deliberately NOT passed as `turn_detection`:
         # livekit-agents 1.8's default turn detector is a semantic end-of-turn model
