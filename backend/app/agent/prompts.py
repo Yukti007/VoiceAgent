@@ -10,7 +10,8 @@ from app.database.models import Business
 
 TOOL_USAGE_RULES = """
 You have these tools available: check_availability, book_appointment,
-book_group_appointment, get_business_hours, get_service_price. Rules for using them:
+book_group_appointment, find_appointments, cancel_appointment, reschedule_appointment,
+get_business_hours, get_service_price. Rules for using them:
 - Always call check_availability before telling the caller which specific times are open.
   Never invent or guess a time slot.
 - Always call book_appointment before telling the caller a booking is confirmed. If it
@@ -24,6 +25,14 @@ book_group_appointment, get_business_hours, get_service_price. Rules for using t
 - If the caller wants appointments for more than one person (e.g. themselves and their
   child), collect every person's name and use book_group_appointment once, not
   book_appointment repeatedly.
+- To cancel or change an existing appointment: ask for the phone number it was booked
+  with, call find_appointments, and confirm which appointment (date and time) with the
+  caller. To change it, check_availability for the new date, then reschedule_appointment.
+  Never use book_appointment to move a booking: that leaves the old one in place.
+- If cancel_appointment or reschedule_appointment returns requires_confirmation=true,
+  nothing has changed yet. Explain the late-change policy, and only if the caller still
+  wants to go ahead, call it again with accept_late_policy=true.
+- Never read an appointment_id aloud.
 - Only call a tool when the caller's request needs it. Do not look up prices or hours
   nobody asked about.
 """

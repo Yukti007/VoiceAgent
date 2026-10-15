@@ -413,9 +413,199 @@ def book_group_appointment(
     return {"success": True, "date": iso_date, "time": parsed_time, "appointments": booked}
 
 
-def _booking_result(appointment: Appointment, customer_name: str, *, already_booked: bool = False) -> dict:
-    result = {
-        "success": True,
+# ---- Changing an existing booking -----------------------------------------
+#
+# The appointment's slot is found by (business, doctor, date, time), which the
+# `uq_slot` constraint makes unambiguous. Cancelling and rescheduling run in the
+# caller's single transaction: a reschedule claims the new slot before it frees
+# the old one, so a failure at any point leaves the original booking intact.
+
+FREE_CHANGE_NOTICE_HOURS = 24
+
+
+def find_appointments(
+    session: Session, *, business_id: str, customer_phone: str, now: datetime | None = None
+) -> dict:
+    """Upcoming confirmed appointments booked on this phone number (the whole
+    household's), soonest first."""
+    try:
+        phone = normalize_phone(customer_phone)
+        business = _load_business(session, business_id)
+    except (InvalidPhoneError, BookingRuleError) as exc:
+        return {"appointments": [], "error": str(exc)}
+    now = now or business_now(business)
+
+    rows = session.execute(
+        select(Appointment)
+        .join(Customer, Appointment.customer_id == Customer.id)
+        .where(
+            Appointment.business_id == business_id,
+            Appointment.status == "confirmed",
+            Customer.phone == phone,
+            Appointment.date >= now.date().isoformat(),
+        )
+        .order_by(Appointment.date, Appointment.time)
+    ).scalars()
+    upcoming = [a for a in rows if (a.date, a.time) > (now.date().isoformat(), now.strftime("%H:%M"))]
+    return {"appointments": [_appointment_fields(a, a.customer.name) for a in upcoming]}
+
+
+def cancel_appointment(
+    session: Session,
+    *,
+    business_id: str,
+    appointment_id: str,
+    customer_phone: str,
+    accept_late_policy: bool = False,
+    now: datetime | None = None,
+) -> dict:
+    """Cancel a confirmed appointment and release its slot.
+
+    Inside the free-change window (FREE_CHANGE_NOTICE_HOURS before the
+    appointment) nothing is cancelled until the caller has heard the policy
+    and the LLM calls again with accept_late_policy=true."""
+    try:
+        business, appointment, now = _load_owned_appointment(
+            session, business_id, appointment_id, customer_phone, now
+        )
+    except (InvalidPhoneError, BookingRuleError) as exc:
+        return {"success": False, "error": str(exc)}
+
+    if appointment.status == "cancelled":
+        return {"success": True, "appointment_id": appointment.id, "already_cancelled": True}
+
+    late = _within_free_change_window(appointment, now)
+    if late and not accept_late_policy:
+        return _late_policy_response(business, appointment, "cancel")
+
+    _release_slot(session, appointment)
+    appointment.status = "cancelled"
+    session.flush()
+    result = _booking_result(appointment, appointment.customer.name) | {"status": "cancelled"}
+    if late:
+        result["late_change"] = True
+    return result
+
+
+def reschedule_appointment(
+    session: Session,
+    *,
+    business_id: str,
+    appointment_id: str,
+    customer_phone: str,
+    new_date: str,
+    new_time: str,
+    doctor: str | None = None,
+    accept_late_policy: bool = False,
+    now: datetime | None = None,
+) -> dict:
+    """Move an appointment to a new date/time, keeping its id and service.
+
+    Claims the new slot first (same doctor preferred unless another is asked
+    for), then releases the old one. If no slot is free, nothing changes."""
+    try:
+        business, appointment, now = _load_owned_appointment(
+            session, business_id, appointment_id, customer_phone, now
+        )
+        if appointment.status != "confirmed":
+            raise BookingRuleError("That appointment is cancelled, so it can't be moved. Offer a new booking.")
+        parsed_date = _parse_iso_date(new_date)
+        parsed_time = _parse_time(new_time)
+        _check_slot_bookable(parsed_date, parsed_time, now)
+        doctor = resolve_doctor(business, doctor)
+    except (InvalidDateError, InvalidPhoneError, BookingRuleError) as exc:
+        return {"success": False, "error": str(exc)}
+
+    iso_date = parsed_date.isoformat()
+    if (appointment.date, appointment.time) == (iso_date, parsed_time) and doctor in (None, appointment.doctor):
+        return _booking_result(appointment, appointment.customer.name, already_booked=True)
+
+    late = _within_free_change_window(appointment, now)
+    if late and not accept_late_policy:
+        return _late_policy_response(business, appointment, "reschedule")
+
+    candidates = _find_candidate_slots(
+        session, business_id=business_id, date=iso_date, time=parsed_time, doctor=doctor
+    )
+    candidates.sort(key=lambda slot: slot.doctor != appointment.doctor)
+    new_slot = next((slot for slot in candidates if _claim_slot(session, slot.id)), None)
+    if new_slot is None:
+        return {
+            "success": False,
+            "error": (
+                f"No available slot on {iso_date} at {parsed_time}"
+                + (f" with {doctor}" if doctor else "")
+                + ". The original appointment is unchanged. Call check_availability for other times."
+            ),
+        }
+
+    old_date, old_time = appointment.date, appointment.time
+    _release_slot(session, appointment)
+    appointment.date, appointment.time, appointment.doctor = iso_date, parsed_time, new_slot.doctor
+    session.flush()
+    result = _booking_result(appointment, appointment.customer.name) | {
+        "previous_date": old_date,
+        "previous_time": old_time,
+    }
+    if late:
+        result["late_change"] = True
+    return result
+
+
+def _load_owned_appointment(
+    session: Session, business_id: str, appointment_id: str, customer_phone: str, now: datetime | None
+) -> tuple[Business, Appointment, datetime]:
+    """The appointment, if it exists and was booked on this phone number. The
+    phone is the only identity check a voice call has here, so a caller can
+    only change bookings made on the number they give."""
+    phone = normalize_phone(customer_phone)
+    business = _load_business(session, business_id)
+    appointment = session.get(Appointment, appointment_id.strip())
+    if appointment is None or appointment.business_id != business_id or appointment.customer.phone != phone:
+        raise BookingRuleError(
+            "No appointment with that id is booked on this phone number. Call find_appointments first."
+        )
+    now = now or business_now(business)
+    if (appointment.date, appointment.time) <= (now.date().isoformat(), now.strftime("%H:%M")):
+        raise BookingRuleError("That appointment time has already passed, so it can't be changed.")
+    return business, appointment, now
+
+
+def _within_free_change_window(appointment: Appointment, now: datetime) -> bool:
+    starts = datetime.fromisoformat(f"{appointment.date}T{appointment.time}").replace(tzinfo=now.tzinfo)
+    return starts - now < timedelta(hours=FREE_CHANGE_NOTICE_HOURS)
+
+
+def _late_policy_response(business: Business, appointment: Appointment, action: str) -> dict:
+    policy = (business.business_knowledge or {}).get("policies", {}).get("cancellation", "")
+    return {
+        "success": False,
+        "requires_confirmation": True,
+        "appointment_id": appointment.id,
+        "error": (
+            f"Nothing changed yet: this appointment is less than {FREE_CHANGE_NOTICE_HOURS} hours away, "
+            f"outside the free-change window. Policy: {policy} Explain this to the caller; only if they "
+            f"still want to {action}, call again with accept_late_policy=true."
+        ),
+    }
+
+
+def _release_slot(session: Session, appointment: Appointment) -> None:
+    session.execute(
+        update(AppointmentSlot)
+        .where(
+            AppointmentSlot.business_id == appointment.business_id,
+            AppointmentSlot.doctor == appointment.doctor,
+            AppointmentSlot.date == appointment.date,
+            AppointmentSlot.time == appointment.time,
+        )
+        .values(is_booked=False)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def _appointment_fields(appointment: Appointment, customer_name: str) -> dict:
+    return {
         "appointment_id": appointment.id,
         "date": appointment.date,
         "time": appointment.time,
@@ -423,6 +613,10 @@ def _booking_result(appointment: Appointment, customer_name: str, *, already_boo
         "doctor": appointment.doctor,
         "customer_name": customer_name,
     }
+
+
+def _booking_result(appointment: Appointment, customer_name: str, *, already_booked: bool = False) -> dict:
+    result = {"success": True, **_appointment_fields(appointment, customer_name)}
     if already_booked:
         result["already_booked"] = True
     return result

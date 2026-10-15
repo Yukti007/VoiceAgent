@@ -128,6 +128,24 @@ async def _run_db_tool(name: str, work: Callable[[], T]) -> T:
         ) from exc
 
 
+def _start_protected_write(context: RunContext[SessionData]) -> dict | None:
+    """Enter the critical section for a tool that writes a booking.
+
+    Once a write starts, a barge-in must not cancel the speech that confirms
+    it -- otherwise the change is saved but the caller never hears it and may
+    try again. If the caller already talked over this turn, refuse instead:
+    don't change a booking on a turn they interrupted. Returns the refusal
+    result, or None to go ahead."""
+    try:
+        context.disallow_interruptions()
+    except RuntimeError:
+        return {
+            "success": False,
+            "error": "Nothing changed: the caller interrupted. Confirm the details with them again.",
+        }
+    return None
+
+
 # How much of a reply to read before choosing the TTS language for it.
 _TTS_LANGUAGE_PEEK_LETTERS = 12
 
@@ -271,18 +289,8 @@ class Assistant(Agent):
             service: Service being booked, e.g. "Consultation" or "Teeth whitening".
             doctor: Optional preferred doctor's name.
         """
-        # Critical section: once the booking is being written, a barge-in must
-        # not cancel the speech that confirms it -- otherwise the slot is
-        # booked but the caller never hears it and may try to book again.
-        try:
-            context.disallow_interruptions()
-        except RuntimeError:
-            # The caller already interrupted before we started; don't book on
-            # a turn they talked over.
-            return {
-                "success": False,
-                "error": "Not booked: the caller interrupted. Confirm the details with them again.",
-            }
+        if (refused := _start_protected_write(context)) is not None:
+            return refused
 
         business_id = context.userdata.business_id
 
@@ -326,13 +334,8 @@ class Assistant(Agent):
             time: 24-hour time HH:MM.
             service: Service being booked, e.g. "Dental cleaning".
         """
-        try:
-            context.disallow_interruptions()
-        except RuntimeError:
-            return {
-                "success": False,
-                "error": "Not booked: the caller interrupted. Confirm the details with them again.",
-            }
+        if (refused := _start_protected_write(context)) is not None:
+            return refused
 
         business_id = context.userdata.business_id
 
@@ -351,6 +354,108 @@ class Assistant(Agent):
         async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
             result = await _run_db_tool("book_group_appointment", _book)
         logger.info("[tool] book_group_appointment(%s) -> %s", patient_names, result)
+        return result
+
+    @function_tool()
+    async def find_appointments(self, context: RunContext[SessionData], customer_phone: str) -> dict:
+        """List the caller's upcoming appointments (everyone booked on their phone number).
+        Call this before cancelling or rescheduling, to get the appointment_id.
+
+        Args:
+            customer_phone: The phone number the appointment was booked with.
+        """
+        business_id = context.userdata.business_id
+
+        def _query() -> dict:
+            with session_scope() as session:
+                return appointment_tools.find_appointments(
+                    session, business_id=business_id, customer_phone=customer_phone
+                )
+
+        result = await _run_db_tool("find_appointments", _query)
+        logger.info("[tool] find_appointments -> %d found", len(result.get("appointments", [])))
+        return result
+
+    @function_tool()
+    async def cancel_appointment(
+        self,
+        context: RunContext[SessionData],
+        appointment_id: str,
+        customer_phone: str,
+        accept_late_policy: bool = False,
+    ) -> dict:
+        """Cancel one of the caller's appointments and free its slot. Only call after the
+        caller has confirmed which appointment (date and time) to cancel.
+
+        Args:
+            appointment_id: From find_appointments. Never read it aloud.
+            customer_phone: The phone number the appointment was booked with.
+            accept_late_policy: Set true only after the caller has heard the late-change
+                policy (returned as requires_confirmation) and still wants to cancel.
+        """
+        if (refused := _start_protected_write(context)) is not None:
+            return refused
+        business_id = context.userdata.business_id
+
+        def _cancel() -> dict:
+            with session_scope() as session:
+                return appointment_tools.cancel_appointment(
+                    session,
+                    business_id=business_id,
+                    appointment_id=appointment_id,
+                    customer_phone=customer_phone,
+                    accept_late_policy=accept_late_policy,
+                )
+
+        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
+            result = await _run_db_tool("cancel_appointment", _cancel)
+        logger.info("[tool] cancel_appointment -> success=%s", result.get("success"))
+        return result
+
+    @function_tool()
+    async def reschedule_appointment(
+        self,
+        context: RunContext[SessionData],
+        appointment_id: str,
+        customer_phone: str,
+        new_date: str,
+        new_time: str,
+        doctor: str | None = None,
+        accept_late_policy: bool = False,
+    ) -> dict:
+        """Move one of the caller's appointments to a new date and time. Use this, never
+        book_appointment, when the caller wants to change an existing booking: it frees the
+        old slot in the same step. Check availability for the new date first.
+
+        Args:
+            appointment_id: From find_appointments. Never read it aloud.
+            customer_phone: The phone number the appointment was booked with.
+            new_date: ISO date YYYY-MM-DD.
+            new_time: 24-hour time HH:MM.
+            doctor: Optional, only if the caller wants a different doctor.
+            accept_late_policy: Set true only after the caller has heard the late-change
+                policy (returned as requires_confirmation) and still wants to reschedule.
+        """
+        if (refused := _start_protected_write(context)) is not None:
+            return refused
+        business_id = context.userdata.business_id
+
+        def _reschedule() -> dict:
+            with session_scope() as session:
+                return appointment_tools.reschedule_appointment(
+                    session,
+                    business_id=business_id,
+                    appointment_id=appointment_id,
+                    customer_phone=customer_phone,
+                    new_date=new_date,
+                    new_time=new_time,
+                    doctor=doctor,
+                    accept_late_policy=accept_late_policy,
+                )
+
+        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
+            result = await _run_db_tool("reschedule_appointment", _reschedule)
+        logger.info("[tool] reschedule_appointment(%s %s) -> success=%s", new_date, new_time, result.get("success"))
         return result
 
     @function_tool()
