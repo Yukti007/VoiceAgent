@@ -133,7 +133,7 @@ def create_token(payload: TokenRequest, settings: Settings = Depends(get_setting
             status_code=503,
             detail=(
                 "LiveKit credentials are not configured. "
-                "Add LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET to backend/.env."
+                "Add LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET to .env in the repo root."
             ),
         )
 

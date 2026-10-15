@@ -52,7 +52,7 @@ def on_startup() -> None:
     missing = settings.missing_credentials()
     if missing:
         logger.warning(
-            "Missing/placeholder credentials: %s. Add real values to backend/.env "
+            "Missing/placeholder credentials: %s. Add real values to .env in the repo root "
             "before starting a realtime call.",
             ", ".join(missing),
         )

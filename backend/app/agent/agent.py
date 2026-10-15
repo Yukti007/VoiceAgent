@@ -2,8 +2,9 @@
 
 Pipeline: browser mic -> LiveKit -> Sarvam Saaras realtime STT -> this Agent's
 LLM (provider-abstracted, OpenAI by default) -> Sarvam Bulbul streaming TTS ->
-LiveKit -> browser speaker. Turn detection/interruption/barge-in is handled by
-AgentSession itself (VAD-based here) -- this file does not reinvent any of that.
+LiveKit -> browser speaker. Turn detection (LiveKit's audio end-of-turn model on
+top of Silero VAD) and barge-in are handled by AgentSession, configured in
+`_build_turn_handling` -- this file does not reinvent any of that.
 
 Run with:
     python -m app.agent.agent dev
@@ -523,46 +524,19 @@ async def entrypoint(ctx: JobContext) -> None:
         userdata=SessionData(business_id=business_id, call_id=call_id, room_name=ctx.room.name),
         stt=sarvam.STTRealtime(
             api_key=settings.sarvam_api_key,
-            # `language` was previously pinned to a fixed BCP-47 code (hi-IN), which
-            # doesn't just set a *default* -- it forces Sarvam to decode every
-            # utterance through that language's model. A pinned "hi-IN" was
-            # confirmed live to mis-transcribe/drop words in English speech (being
-            # decoded through a Hindi acoustic/language model) and to report every
-            # utterance's language as "hi" regardless of what was actually said --
-            # which then fed a Hindi (or garbled) transcript to the LLM, whose
-            # "reply in the caller's language" instruction faithfully mirrored that
-            # mistake back in Hindi even when the caller spoke English. `"auto"` is
-            # a first-class value here (see livekit-plugins-sarvam's
-            # RealtimeSTTOptions.language / SUPPORTED_LANGUAGES) that runs Sarvam's
-            # own per-utterance language identification instead, so English and
-            # Hindi/Hinglish speech are each decoded through their own model and
-            # `ev.language` on user_input_transcribed reports what was actually
-            # detected -- which is also what the TTS-retargeting handler below
-            # already relies on.
+            # "auto" runs Sarvam's per-utterance language ID. Pinning hi-IN pushed
+            # English speech through the Hindi model and garbled it.
             language=settings.sarvam_stt_language,
-            # "codemix" was separately confirmed to render pure-English utterances
-            # as Devanagari-script phonetic transliteration (e.g. "Hi Aisha, how are
-            # you?" -> "हाय आयशा, हाउ आर यू?") even independent of the language-pin
-            # issue above. "transcribe" is standard transcription in the language
-            # actually spoken/detected, which is what we want; "codemix" is for
-            # genuinely mixed Hindi/English *within one utterance*, not a wholesale
-            # script choice.
+            # "codemix" transliterated plain English into Devanagari; "transcribe"
+            # keeps each utterance in the script it was spoken in.
             mode="transcribe",
             sample_rate=AUDIO_SAMPLE_RATE_IN,
             prompt=stt_vocabulary_hint,
         ),
         llm=get_agent_llm_with_fallback(settings),
         tts=tts,
-        # `vad` still gates raw speech/silence framing (and is required by the STT/TTS
-        # provider interfaces below), but deliberately NOT passed as `turn_detection`:
-        # livekit-agents 1.8's default turn detector is a semantic end-of-turn model
-        # (inference.TurnDetector, per-language thresholds incl. "hi") that judges
-        # whether a pause is really turn-final instead of just timing raw silence.
-        # Forcing turn_detection="vad" (the previous config) disables that model and
-        # falls back to a fixed silence timeout -- worse latency on confident turn
-        # ends AND more false interruptions on mid-sentence pauses, which are exactly
-        # this demo's two headline risks for Hindi/Hinglish speech. Leaving
-        # `turn_detection` unset lets AgentSession pick that smart default.
+        # VAD frames raw speech/silence; whether a pause actually ends the turn is
+        # decided by the turn detector in `turn_handling` (see _build_turn_handling).
         vad=ctx.proc.userdata["vad"],
         turn_handling=_build_turn_handling(settings),
         conn_options=SESSION_CONN_OPTIONS,
