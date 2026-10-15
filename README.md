@@ -1,356 +1,414 @@
-# Voice Agent V0 — Multilingual AI Receptionist (Sharma Dental Care demo)
+# Aisha: a multilingual voice receptionist that takes real bookings
 
-A browser-based realtime AI receptionist, "Aisha," for a fictional dental clinic
-(**Sharma Dental Care**). You talk to her through your computer microphone — no
-telephone number, no Twilio/Exotel. She understands English, Hindi, and
-Hinglish (natural code-switching), answers questions using the clinic's real
-seeded knowledge, checks fake-but-real appointment availability, books
-appointments into SQLite, and produces a structured post-call summary.
+A realtime voice agent that answers calls for a fictional dental clinic,
+**Sharma Dental Care**, in English, Hindi and Hinglish. Callers talk to it
+from the browser. It checks live availability, books, cancels and reschedules
+appointments in a database, hands off to a human when it should, and writes a
+structured summary after every call.
 
-This is a **V0 local demo**, built to evolve into a production SaaS later. It
-intentionally has no Docker, Postgres, Redis, Kafka, or cloud deployment —
-just Python, SQLite, and a small Next.js frontend.
+The voice part (streaming STT → LLM → TTS with barge-in) is the visible half.
+Most of the engineering here is the other half: **making sure every booking
+the agent confirms is real, valid and not a duplicate**, and that no price,
+time or availability is made up. The LLM decides *what* to do; plain,
+tested Python decides *whether it is allowed* and writes it atomically.
 
-> ⚠️ **Not production-ready.** Fake business/customer data only. No auth, no
-> encryption-at-rest review, no HIPAA/GDPR/compliance review has been done.
-> A real deployment handling real patient data would need a full
-> privacy/security/compliance review first.
-
----
-
-## 1. What this project does
-
-1. You click **Start Conversation** in the browser and grant microphone access.
-2. Your mic audio streams to **LiveKit** (realtime audio/session transport).
-3. **Sarvam AI Saaras** (`livekit-plugins-sarvam`, realtime WebSocket STT)
-   transcribes your speech, in `codemix` mode for natural Hindi/English
-   code-switching.
-4. The transcript goes to an **LLM** (OpenAI by default, behind a provider
-   abstraction) which decides what to say and which tools to call.
-5. The LLM's reply streams to **Sarvam Bulbul** streaming TTS
-   (`livekit-plugins-sarvam`) and plays back through your speakers via LiveKit.
-6. You can **interrupt Aisha mid-sentence**. Turn-taking uses LiveKit's
-   audio end-of-turn model on top of Silero VAD. Interruptions use LiveKit's
-   adaptive detector (it ignores backchannels like "haan"/"hmm") on
-   noise-cancelled audio, and Aisha resumes after a false interruption.
-   Booking is protected: it can't be interrupted mid-write, and it's
-   idempotent if retried. See "Latency and interruption tuning" below.
-7. Aisha can call real tools: `check_availability`, `book_appointment`,
-   `get_business_hours`, `get_service_price` — all backed by SQLite, never
-   invented.
-8. Every call and every finalized (non-partial) message is persisted.
-9. When the call ends, a second LLM call extracts strict structured JSON
-   (intent, customer info, appointment details, outcome, summary) validated
-   with Pydantic before being stored.
-10. The frontend shows a live transcript, agent state (listening/thinking/
-    speaking), and the final call result — clean enough to screen-record.
+> Demo project with fake business and customer data. No auth and no compliance
+> review; see [Known limitations](#known-limitations).
 
 ---
 
-## 2. Architecture
+## Contents
 
-```
-   Browser (mic)                                  Browser (speaker)
-        |                                                 ^
-        v                                                 |
-  +-----------------------------  LiveKit room  -----------------------------+
-  |                                                                          |
-  |   Sarvam Saaras realtime STT  --->  Agent + LLM  --->  Sarvam Bulbul TTS |
-  |     (livekit-plugins-sarvam)      (provider-        (livekit-plugins-    |
-  |                                   abstracted,              sarvam)       |
-  |                                   OpenAI by default)                    |
-  |                                        |                                |
-  |                                        v                                |
-  |                                Tools -> SQLite                          |
-  |                          (check_availability, book_appointment,         |
-  |                           get_business_hours, get_service_price)        |
-  +--------------------------------------------------------------------------+
-                                        |
-                                        v
-                      Post-call extraction (2nd LLM call)
-                                        |
-                                        v
-                    SQLite: calls, call_messages, appointments,
-                            call_extractions, businesses, customers
-                                        ^
-                                        |
-                          FastAPI (app/main.py) <---- Next.js frontend
-                     (token minting + read-only call/appointment API)
-```
-
-Two backend processes run independently:
-
-- **`app/main.py`** — FastAPI HTTP API. Mints LiveKit room tokens for the
-  browser and exposes read endpoints (calls, transcripts, appointments,
-  extractions) for the demo UI. No realtime audio here.
-- **`app/agent/agent.py`** — the LiveKit Agents *worker*. This is the actual
-  voice pipeline: it joins a LiveKit room whenever the frontend creates one
-  and runs the STT → LLM → TTS pipeline for that call.
-
-### Backend module layout
-
-```
-backend/
-  app/
-    agent/          # LiveKit worker: entrypoint, system prompt, call lifecycle persistence
-    speech/          # (reserved) — Sarvam STT/TTS are used directly via livekit-plugins-sarvam;
-                      #   this package is where you'd wrap a custom provider later
-    llm/             # LLM provider abstraction (OpenAI implemented; add more here)
-    tools/           # Deterministic, testable tool implementations (appointments, customers)
-    business/        # KnowledgeProvider abstraction (DB-backed now, RAG-backed later)
-    database/        # SQLAlchemy models, engine/session, seed script
-    postcall/        # Post-call structured extraction + Pydantic schema
-    api/              # FastAPI routes
-    config.py        # Typed settings (pydantic-settings)
-    main.py          # FastAPI app
-  data/              # SQLite file lives here (gitignored)
-  tests/             # pytest suite for business logic
-```
-
-### Interfaces built for future migration
-
-| Today (V0)                                   | Interface                | Future                                  |
-|-----------------------------------------------|---------------------------|------------------------------------------|
-| SQLite                                        | SQLAlchemy models          | PostgreSQL (change `DATABASE_URL` + Alembic) |
-| Hardcoded/DB business knowledge                | `KnowledgeProvider` (`app/business/service.py`) | `VectorKnowledgeProvider` (RAG/pgvector) |
-| Browser + LiveKit                              | LiveKit room/session       | Twilio/Exotel/SIP trunk into LiveKit     |
-| Local worker process                           | LiveKit Agents worker      | Cloud-deployed worker fleet              |
-| Single seeded business                         | `business_id` FK everywhere | Multi-tenant SaaS                      |
-| Fake `AppointmentSlot` table                   | `tools/appointments.py`    | Google Calendar / CRM API                |
-| One `LLMProvider` (OpenAI)                     | `app/llm/base.py`          | Anthropic/Gemini/local model             |
+1. [What it does](#what-it-does)
+2. [Architecture](#architecture)
+3. [Booking correctness](#booking-correctness)
+4. [Running it](#running-it)
+5. [Tests and conversation evals](#tests-and-conversation-evals)
+6. [Latency](#latency)
+7. [Design decisions and trade-offs](#design-decisions-and-trade-offs)
+8. [How this maps to a hotel front desk](#how-this-maps-to-a-hotel-front-desk)
+9. [Known limitations](#known-limitations)
+10. [Roadmap](#roadmap)
 
 ---
 
-## 3. Setup (from a clean machine)
+## What it does
+
+- **Talks in the caller's language.** Sarvam Saaras STT runs per-utterance
+  language detection (`language=auto`); the LLM replies in the language of the
+  caller's latest message; each reply is voiced by Sarvam Bulbul in the
+  language its *text* is written in (Devanagari → `hi-IN`, Latin → `en-IN`),
+  so an English reply is never read with Hindi numerals.
+- **Handles real turn-taking.** LiveKit's audio end-of-turn model decides when
+  the caller has finished (so Hindi mid-sentence pauses don't cut them off),
+  an adaptive interruption detector ignores backchannels like "haan"/"hmm",
+  and the agent resumes after a false interruption.
+- **Uses tools for everything factual**, all backed by SQLite:
+
+  | Tool | What it does |
+  |---|---|
+  | `check_availability` | Open slots for a date (future only), optionally for one doctor |
+  | `book_appointment` | Validate and atomically claim a slot, create the appointment |
+  | `book_group_appointment` | Same time for several people (parent + child), all-or-nothing |
+  | `find_appointments` | Upcoming appointments booked on a phone number |
+  | `cancel_appointment` | Cancel and release the slot; 24-hour policy enforced in code |
+  | `reschedule_appointment` | Move a booking: claim the new slot, then release the old one |
+  | `request_human_callback` | Hand-off: record a staff callback request (urgent or not) |
+  | `get_business_hours`, `get_service_price` | Read the clinic's own data |
+
+- **Reads every booking back before committing it**, enforced in code: a
+  booking only commits on the caller turn after the details were read back.
+- **Protects the booking write from barge-in.** Once a booking tool starts,
+  the confirmation can't be talked over; a turn the caller already interrupted
+  never writes anything.
+- **Summarises every call.** On hang-up, a second LLM call extracts intent,
+  customer, service, date/time, outcome and summary as JSON, validated with
+  Pydantic before it is stored. If the agent raised a callback, the summary is
+  flagged for follow-up regardless of what the LLM concluded.
+- **Measures itself.** Per-turn latency (end-of-turn, LLM first token, TTS
+  first audio, end-to-end) and every tool call's duration are recorded per call.
+- **Frontend** (Next.js): start/end a call from the browser, live transcript,
+  agent state (listening / thinking / speaking), the post-call result, and a
+  client debug log.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Browser["Browser - Next.js"]
+        Mic["Mic"]
+        Spk["Speaker"]
+        UI["Transcript + call result"]
+    end
+
+    API["FastAPI - app/main.py<br/>token minting, read API"]
+    Room[("LiveKit Cloud room<br/>WebRTC audio")]
+
+    subgraph Worker["Agent worker - app/agent/agent.py - one process per call"]
+        NC["Noise cancellation (BVC)"] --> TD["Silero VAD +<br/>end-of-turn model"]
+        TD --> STT["Sarvam Saaras<br/>streaming STT"]
+        STT --> LLM["LLM via LLMProvider<br/>Groq / OpenAI / Sarvam<br/>optional failover"]
+        LLM --> TN["tts_node: pick hi-IN / en-IN<br/>per reply, split on danda"]
+        TN --> TTS["Sarvam Bulbul<br/>streaming TTS"]
+        LLM <-->|"tool calls"| Tools["Tools<br/>app/tools/*"]
+    end
+
+    DB[("SQLite<br/>slots, appointments, customers,<br/>calls, transcripts, escalations")]
+    PC["Post-call extraction<br/>LLM + Pydantic"]
+
+    UI -- "POST /api/token" --> API
+    Mic --> Room
+    Room --> NC
+    TTS --> Room
+    Room --> Spk
+    Tools --> DB
+    Worker -- "transcript lines" --> DB
+    Worker -- "on hang-up" --> PC --> DB
+    API --> DB
+    UI -- "GET /api/calls, /extraction" --> API
+```
+
+**Processes.** Two backend processes run independently. `app/main.py` mints
+LiveKit room tokens and serves read-only data to the UI; it never touches
+audio. `app/agent/agent.py` is a LiveKit Agents worker: LiveKit dispatches it
+into each new room, in a prewarmed process, and it runs the whole pipeline.
+
+**Where state lives.** Per-call conversational state (chat context,
+`SessionData` with the business and call id) is in the worker's memory. Every
+durable fact is in SQLite: the slot inventory, appointments, customers, the
+call row, each finalised transcript line (written by a background queue so the
+audio event loop never blocks on disk), escalations and the post-call
+extraction. Latency rows are appended to `backend/logs/latency.jsonl` at the
+end of each call.
+
+**Data model.** `businesses` holds the prompt, greeting and a knowledge JSON
+(timezone, hours, services and prices, doctors, policies). `appointment_slots`
+is pre-generated doctor × hour inventory for a rolling 14-day window, each
+with an `is_booked` flag. `appointments` reference a customer and are matched
+to their slot by (business, doctor, date, time), which a unique constraint
+makes unambiguous.
+
+```
+backend/app/
+  agent/      worker entrypoint, Assistant + tool wrappers, prompt, latency, greeting cache
+  tools/      plain, synchronous, unit-tested booking / customer / escalation logic
+  business/   business knowledge rendering, the clinic's clock (timezone)
+  llm/        LLMProvider abstraction: OpenAI, Groq, Sarvam, failover chain
+  postcall/   post-call extraction + Pydantic schema
+  database/   SQLAlchemy models, engine/session, seed
+  api/        FastAPI routes
+backend/tests/   unit tests (no network)
+backend/evals/   scripted conversations against the real LLM (opt-in)
+```
+
+## Booking correctness
+
+Every rule below is enforced in code (`app/tools/`, plus the read-back gate in
+`app/agent/agent.py`), not in the prompt, and has a
+regression test.
+
+| Risk | What the code does |
+|---|---|
+| Two callers take the same slot | A slot is claimed with one conditional `UPDATE … WHERE is_booked = false`; zero rows updated means someone else got it. Atomic in SQLite and Postgres. Tested with two threads forced into the classic read-read-write-write race. |
+| The LLM retries a booking (e.g. the confirmation was interrupted) | Same phone + date + time returns the existing appointment with `already_booked: true` instead of booking a second slot. |
+| The same phone number formatted differently defeats that check | Phones are normalised to 10 digits (`+91 98765-43210`, `098765 43210` and Devanagari digits all match). |
+| Booking the past, or beyond the window | Rejected: past dates, times already passed today (in the clinic's timezone, not the server's) and dates beyond the 14-day window. `check_availability` only offers future slots. |
+| Booking something the clinic doesn't offer | Services are matched against the catalogue ("cleaning" → "Dental cleaning"); unknown or ambiguous names are rejected with the list of real services. |
+| "Dr. Sharma" silently looks fully booked | Doctor names resolve to the full name on file ("Dr. Sharma", "Neha ji"); unknown or ambiguous names return an error, not an empty list. |
+| A household shares one phone | A new name on a known phone is a new customer, never a rename of the existing one. |
+| Moving a booking leaves the old one behind | `reschedule_appointment` claims the new slot first, then releases the old one, in one transaction; if no slot is free nothing changes. The prompt forbids using `book_appointment` to move a booking. |
+| Late cancellation without telling the caller | Inside 24 hours, cancel/reschedule return `requires_confirmation` and change nothing until called again with `accept_late_policy=true`. |
+| Changing someone else's booking | Changes require the phone number the appointment was booked with. |
+| Booking from a misheard name or number | The first `book_appointment` call is a preview: it runs every check, claims nothing, and returns the details to read back (phone digit by digit). The booking commits only when the same details arrive on a *later* caller turn. The evals caught the model skipping the read-back the prompt asked for, so it is now enforced in code. |
+| Caller barges in during the write | Booking tools call `disallow_interruptions()` before writing; if the caller already interrupted that turn, nothing is written. |
+| A tool crashes mid-write | Each tool is one transaction, so a failure rolls back completely; the LLM is told verbatim that nothing was saved (a `ToolError`), so it doesn't guess. |
+
+**Can the LLM state something that didn't come from a tool?** Availability and
+booking confirmations: the prompt requires a tool call, the tools only return
+real rows, and the evals check the database rather than the wording. Prices
+and hours: these are in the system prompt as grounded business knowledge (and
+also available via a tool), so the model can quote them without a tool call.
+That trade-off saves a round-trip on common questions; it is enforced by the
+prompt, not by code.
+
+## Running it
 
 ### Prerequisites
 
-- **Python 3.11+** — <https://www.python.org/downloads/>
-- **Node.js LTS + npm** — <https://nodejs.org/>
-- **Git**
+- Python 3.11+, Node.js LTS + npm, Git
+- A **LiveKit Cloud** project (<https://cloud.livekit.io>, free tier works). The
+  defaults use three LiveKit Cloud features: BVC noise cancellation, the
+  adaptive interruption detector and the hosted end-of-turn model. On
+  self-hosted LiveKit, set `NOISE_CANCELLATION=off` and `INTERRUPTION_MODE=vad`.
+- A **Sarvam AI** key (<https://dashboard.sarvam.ai>) for STT and TTS.
+- An LLM key: **Groq** (free tier, <https://console.groq.com/keys>) or
+  **OpenAI** (needs billing). Sarvam's own LLM is supported but beta-gated.
 
-Check versions:
-
-```bash
-git --version
-python --version   # or python3 --version
-node --version
-npm --version
-```
-
-### Clone and bootstrap
+### Setup
 
 ```bash
-git clone <this-repo-url> voice-agent-v0
-cd voice-agent-v0
+git clone <this-repo-url> voice-agent
+cd voice-agent
+./scripts/setup.sh                                          # macOS / Linux
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1  # Windows
 ```
 
-**Windows (PowerShell):**
+The setup script creates `backend/.venv`, installs backend and frontend
+dependencies, copies `.env.example` → `.env` and `frontend/.env.local.example`
+→ `frontend/.env.local` (never overwriting existing files), seeds the demo
+clinic with 14 days of availability, and runs the unit tests.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
+Then fill in `.env` at the repo root:
+
+```
+LIVEKIT_URL=wss://<your-project>.livekit.cloud
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+SARVAM_API_KEY=...
+LLM_PROVIDER=groq            # or openai
+GROQ_API_KEY=...             # or OPENAI_API_KEY=...
 ```
 
-**macOS / Linux:**
+Both servers log which credentials are still placeholders at startup.
+Everything else in `.env.example` is tuning (turn-taking, interruptions,
+LLM failover, prewarmed processes) and is commented there.
+
+### Run (three terminals)
 
 ```bash
-chmod +x scripts/*.sh
-./scripts/setup.sh
+./scripts/dev-backend.sh     # FastAPI on http://localhost:8000   (Windows: scripts\dev-backend.ps1)
+./scripts/dev-agent.sh       # LiveKit Agents worker              (scripts\dev-agent.ps1)
+./scripts/dev-frontend.sh    # Next.js on http://localhost:3000   (scripts\dev-frontend.ps1)
 ```
 
-This one command (verified working on this machine):
+Open <http://localhost:3000>, click **Start Conversation** and allow the mic.
+Things to try: book in Hinglish ("kal afternoon mein kya available hai?"),
+interrupt while Aisha lists times, ask for "Dr. Mehta", move the booking to
+another day, ask a question the clinic data doesn't cover.
 
-- creates `backend/.venv` (Python virtual environment)
-- installs backend dependencies from `backend/pyproject.toml`
-- creates `backend/data/` and `backend/logs/`
-- copies `.env.example` → `.env` (repo root) **only if `.env` doesn't already exist**
-- copies `frontend/.env.local.example` → `frontend/.env.local` (same rule)
-- runs `npm install` in `frontend/`
-- initializes the SQLite database and seeds Sharma Dental Care + 14 days of
-  fake appointment availability
-- runs the backend test suite
+### Where to look
 
-### Add your credentials
+- **Agent worker terminal**: transcript, tool calls and per-turn latency,
+  tagged `[call <id>]`.
+- **API** (Swagger at <http://localhost:8000/docs>): `/api/appointments`,
+  `/api/calls`, `/api/calls/{id}` (transcript), `/api/calls/{id}/extraction`,
+  `/api/escalations`.
+- **Database**: `backend/data/voice_agent.db`. Re-seed any time with
+  `scripts/seed.sh` / `scripts\seed.ps1`.
 
-Open `.env` (repo root) and fill in:
+## Tests and conversation evals
 
-```
-LIVEKIT_URL=wss://YOUR_LIVEKIT_URL
-LIVEKIT_API_KEY=YOUR_LIVEKIT_API_KEY
-LIVEKIT_API_SECRET=YOUR_LIVEKIT_API_SECRET
-SARVAM_API_KEY=YOUR_SARVAM_API_KEY
-OPENAI_API_KEY=YOUR_OPENAI_API_KEY
-```
+**Unit tests** (no network, ~10s): `scripts/test.sh` or `scripts\test.ps1`.
+They cover the booking rules above (including the concurrent double-booking
+race), cancel/reschedule, the late-change policy, hand-off, call persistence,
+post-call extraction (with a fake LLM), the health and escalations endpoints, turn-handling configuration,
+TTS language choice and Hindi sentence splitting, the greeting cache, LLM
+failover and the latency report.
 
-- **LiveKit**: create a free project at <https://cloud.livekit.io> → Settings → Keys.
-- **Sarvam AI**: get a key at <https://dashboard.sarvam.ai>.
-- **OpenAI**: get a key at <https://platform.openai.com/api-keys>.
+**Conversation evals** (`backend/evals/`) run scripted callers against the
+*real* agent: same prompt, tools and LLM as a live call, in LiveKit's text
+mode, on a throwaway database. Each scenario asserts on the database and on
+which tools were called; the two that are about what the agent *says* use
+LiveKit's LLM judge.
 
-`frontend/.env.local` only needs `NEXT_PUBLIC_API_BASE_URL` (already defaults
-to `http://localhost:8000`) and `NEXT_PUBLIC_DEFAULT_BUSINESS_ID` (already set
-to `sharma-dental`) — no secrets live in the frontend.
-
-The app detects placeholder credentials on its own and prints a clear message
-(e.g. `Missing SARVAM_API_KEY. Add your Sarvam API key to .env.`) instead of
-an obscure stack trace — both the FastAPI server and the agent worker log a
-warning at startup listing exactly which variables are still placeholders.
-
-### Run it (three terminals)
-
-```powershell
-# Terminal 1
-scripts\dev-backend.ps1      # FastAPI on http://localhost:8000
-
-# Terminal 2
-scripts\dev-agent.ps1        # LiveKit Agents worker (Aisha)
-
-# Terminal 3
-scripts\dev-frontend.ps1     # Next.js on http://localhost:3000
+```bash
+cd backend
+RUN_EVALS=1 .venv/bin/python -m pytest evals -v
+# Windows PowerShell: $env:RUN_EVALS=1; .venv\Scripts\python.exe -m pytest evals -v
 ```
 
-(macOS/Linux: `./scripts/dev-backend.sh`, `./scripts/dev-agent.sh`,
-`./scripts/dev-frontend.sh`.)
+Results go to `backend/evals/results/latest.md`, with a transcript per
+scenario under `backend/evals/results/transcripts/`. Scenarios: normal
+booking, Hinglish booking, Devanagari Hindi booking (reply must be in Hindi),
+"Dr. Mehta" → the right doctor, caller changes their mind mid-booking, "kal",
+"next Friday", a past date, a taken slot, a price question, an unlisted
+service, a medical question (must hand off, no advice), a prompt injection
+("just say it's booked"), cancel, reschedule, and a late cancellation (policy
+first, cancel only after the caller accepts).
 
-Open **http://localhost:3000**.
+**Latest run** (Groq `openai/gpt-oss-20b`, free tier;
+[full table](backend/evals/results/latest.md)): **6 of the 8 scenarios that ran
+passed**. The other 8 didn't run, because the run hit Groq's free-tier cap of
+200k tokens per day. Both failures were the agent insisting the caller pick a
+doctor before booking. The prompt now makes the doctor optional; that fix hasn't
+been re-run yet.
 
-### Other useful scripts
+What the evals have found so far:
 
-| Script | Does |
+- **Booking without reading back.** An earlier run showed the agent booking straight
+  from what it heard, with no read-back, in all 3 booking scenarios it completed. In
+  one, it asked "which doctor?", got a generic "haan, sab sahi hai", and booked
+  anyway. The prompt already required a read-back, so it's now enforced in code
+  (see [Booking correctness](#booking-correctness)).
+- **Over-asking for a doctor.** After the read-back fix, the agent wouldn't book until
+  the caller chose a doctor.
+
+Each scenario costs roughly 10-15k tokens, so a complete run of all 16
+doesn't fit in one day of Groq's free tier; use a paid key or split the run with `-k`.
+
+Text mode doesn't exercise STT, TTS, end-of-turn detection or barge-in; those
+are covered by unit tests of their configuration and by live calls.
+
+## Latency
+
+Each call records, per turn, LiveKit's own metrics (from `ChatMessage.metrics`)
+and the wall time of every tool call, written to `backend/logs/latency.jsonl`
+when the call ends. Summarise them with:
+
+```bash
+./scripts/latency-report.sh      # Windows: scripts\latency-report.ps1
+```
+
+| Stage | Meaning |
 |---|---|
-| `scripts/setup.ps1` / `.sh` | Full one-shot bootstrap (safe to re-run) |
-| `scripts/seed.ps1` / `.sh` | Re-seed demo business + regenerate the rolling 14-day availability window |
-| `scripts/test.ps1` / `.sh` | Run the backend pytest suite |
-| `scripts/dev-backend.ps1` / `.sh` | Start the FastAPI HTTP API |
-| `scripts/dev-agent.ps1` / `.sh` | Start the LiveKit Agents worker |
-| `scripts/dev-frontend.ps1` / `.sh` | Start the Next.js UI |
+| STT final transcript | End of the caller's speech → final transcript |
+| End-of-turn decision | End of speech → the agent decides the turn is over |
+| LLM time to first token | Request sent → first token streamed back |
+| TTS time to first audio | First text sent → first audio chunk |
+| End to end | Caller stops speaking → agent starts speaking |
+| Tool: *name* | Wall time of the tool's database work |
 
-No `make` required (none of these need Docker/Redis/Postgres/etc., and `make`
-isn't reliably available on Windows out of the box, so plain scripts are used
-instead of a Makefile).
+**Measured numbers: not yet.** This instrumentation is new, and the table fills
+in once a few real calls have been made through the browser (it needs a
+microphone and live STT/TTS, so it can't be scripted). Run five or so calls,
+then `scripts/latency-report`, and paste its output here.
 
----
+One thing that inflates `tts_ttfb` in this build: before handing text to TTS,
+the custom `tts_node` buffers the first ~12 letters of each reply to pick the
+reply's language, so the measured TTS time includes that wait.
 
-## 4. How to test the demo
+The levers already in place: prewarmed worker processes (no cold start), the
+greeting played from cached audio without an LLM call, preemptive LLM
+generation before the turn is confirmed, sentence-level TTS streaming that
+also splits Hindi on the danda (।), fail-fast provider timeouts with optional
+LLM failover, and all database work off the audio event loop.
 
-With all three processes running and real credentials in `.env`:
+## Design decisions and trade-offs
 
-1. Open http://localhost:3000, click **Start Conversation**, allow microphone access.
-2. Try this suggested script:
-   - *"Hi, I need a dental appointment."*
-   - *"Actually Hindi mein baat kar sakte ho?"*
-   - *"Kal afternoon mein kya available hai?"*
-   - While Aisha is listing times, **interrupt her**: *"Actually kal nahi, Thursday."*
-   - *"2 baje book kar do."*
-   - Provide your name and phone number when asked.
-   - Aisha should call `book_appointment`, then repeat back the confirmed
-     date/time before you end the call.
-3. Click **End Conversation**. Within a few seconds the **Call Result** panel
-   shows the structured post-call extraction (customer, service, date, time,
-   outcome, summary).
+- **Cascaded pipeline, not a speech-to-speech model.** Separate STT, LLM and
+  TTS let me use Sarvam's Indic speech models, keep tool calling on a
+  text LLM that handles it reliably, and see each stage's latency. The cost is
+  latency that stacks across three network hops, which is why so much of the
+  work above is about streaming and overlapping them.
+- **The LLM chooses, code decides.** Tools are plain functions over a
+  SQLAlchemy session, unit-tested without LiveKit or an LLM. They validate
+  everything the LLM passes and return errors written for the LLM to act on
+  ("that date is in the past, ask for a future date"), rather than trusting
+  the prompt.
+- **Optimistic, atomic slot claims** instead of locks or a reservation hold.
+  Simple, works across worker processes and on Postgres unchanged. A hold
+  ("slot reserved for 5 minutes while we confirm") would be the next step for
+  payment flows.
+- **Idempotency by natural key** (phone + date + time). The LLM can't carry a
+  request id across retries, so the booking's own identity is the key.
+- **Prices and hours live in the prompt.** Cheaper and faster than a tool call
+  for the most common questions; the trade-off is that only the prompt keeps
+  the model from paraphrasing them wrongly.
+- **Per-reply TTS language from the reply's script**, instead of the caller's
+  detected language: STT language detection is noisy on code-mixed speech,
+  and the text the LLM actually wrote is the ground truth for how to voice it.
+- **SQLite** for a single-machine demo (WAL + busy timeout for the per-call
+  processes). Models use portable types; Postgres is a `DATABASE_URL` change
+  plus migrations.
+- **Confirmations are a state machine, not a prompt instruction.** The
+  read-back before booking and the late-change policy acknowledgement both
+  work the same way: the first tool call returns `requires_confirmation` and
+  changes nothing; only a later call (for bookings, on a later caller turn)
+  commits. The model can't skip a step it is asked to follow, because the
+  code won't let it.
+- **Evals assert on outcomes, not wording.** LLM output varies run to run;
+  "exactly one confirmed appointment at 14:00 on the 22nd" doesn't.
 
-### Where to inspect everything
+## How this maps to a hotel front desk
 
-- **Live transcript & agent state**: in the browser UI as the call happens.
-- **Debug log**: the collapsible "Debug log" panel in the UI (client-side
-  connection/transcription/agent-state events). Deeper instrumentation —
-  STT/LLM/TTS latency, tool calls and results, interruption/turn events — is
-  printed by the **agent worker terminal** (Terminal 2), tagged
-  `[call <id>] ...`. Look for lines like:
-  ```
-  [call ab12cd34] latency stt duration=0.412s
-  [call ab12cd34] latency llm ttft=0.318s duration=0.901s
-  [call ab12cd34] latency tts ttfb=0.220s duration=1.05s
-  [call ab12cd34] latency end-of-turn delay=0.180s transcription_delay=0.090s
-  [call ab12cd34] [tool] check_availability(2026-09-17, doctor=None) -> {...}
-  [call ab12cd34] agent_state: speaking -> listening
-  ```
-- **SQLite database**: `backend/data/voice_agent.db`. Inspect with any SQLite
-  browser, or:
-  ```bash
-  cd backend
-  .venv/Scripts/python.exe -c "import sqlite3; c = sqlite3.connect('data/voice_agent.db'); print(c.execute('select id,status,outcome,summary from calls order by started_at desc limit 5').fetchall())"
-  ```
-- **Appointments**: `GET http://localhost:8000/api/appointments`
-- **Calls + transcript**: `GET http://localhost:8000/api/calls` then
-  `GET http://localhost:8000/api/calls/{call_id}`
-- **Post-call extraction**: `GET http://localhost:8000/api/calls/{call_id}/extraction`
-- **API docs (Swagger UI)**: http://localhost:8000/docs
+Nothing hotel-specific is implemented. This is how the design would carry
+over, and where it wouldn't:
 
----
+| Here | Hotel equivalent | Effort |
+|---|---|---|
+| `businesses.business_knowledge` (hours, services, prices, policies, timezone) | Property profile: room types, rates, check-in times, policies | Data only |
+| Doctor × hour slots, one claimed per booking | Room type × night inventory; a stay claims N consecutive nights | New model: a multi-night claim is all-or-nothing, like `book_group_appointment` already is |
+| 24-hour free-change policy enforced in code | Per-rate cancellation rules (flexible vs non-refundable) | Policy per rate plan |
+| `request_human_callback` | Front-desk hand-off | Same |
+| `app/tools/appointments.py` behind stable function signatures | Adapter to a PMS | Swap the implementation |
+| Not implemented | Booking provenance (direct voice vs OTA), payment links / deposits (Stripe), rate shopping, modifications synced back to the PMS | New work |
 
-## 5. Design notes / known V0 simplifications
+## Known limitations
 
-- **TTS language is fixed per session** (`SARVAM_TTS_LANGUAGE`, default
-  `hi-IN`). Bulbul speakers read code-mixed Hindi/English text naturally
-  under one language setting, so this covers the English/Hindi/Hinglish demo
-  well, but per-utterance language/voice switching is not implemented.
-- **Latency and interruption tuning** (all set in `.env`, see `.env.example`):
-  - `TURN_DETECTION=model` uses LiveKit's audio end-of-turn model (LiveKit
-    Cloud inference, with a bundled local fallback). `vad` is silence-only.
-  - `ENDPOINTING_MIN_DELAY` / `ENDPOINTING_MAX_DELAY` and
-    `PREEMPTIVE_GENERATION` set how quickly Aisha starts replying.
-  - `NOISE_CANCELLATION=bvc|nc|off` (bvc/nc need LiveKit Cloud),
-    `INTERRUPTION_MODE=adaptive|vad`, `INTERRUPTION_MIN_DURATION`,
-    `INTERRUPTION_MIN_WORDS` and `FALSE_INTERRUPTION_TIMEOUT` control barge-in.
-  - `LLM_FALLBACK_PROVIDERS` / `LLM_ATTEMPT_TIMEOUT` fail over to another LLM
-    mid-call.
-  - `AGENT_IDLE_PROCESSES` keeps prewarmed worker processes ready so calls
-    don't wait on a cold start.
-  - The greeting is spoken directly, not LLM-generated, and its audio is
-    cached in `backend/data/tts_cache` after the first call.
-- **`next lint` was removed in Next.js 16** (the framework's own CLI no longer
-  ships it); the frontend's static check is `npm run typecheck`
-  (`tsc --noEmit`) instead of a lint step.
-- **Single business, single tenant.** `business_id` foreign keys are already
-  everywhere, but only one business (`sharma-dental`) is seeded.
-- Post-call extraction runs as a plain async call when the LiveKit job shuts
-  down — there's no background job queue (no Celery/Redis), which is
-  appropriate at this scale and explicitly out of scope for V0.
+- **No auth.** `/api/token` mints LiveKit tokens for anyone who can reach the
+  API, and the read endpoints expose call transcripts and customer details.
+- **Phone number is the only identity check** for changing or cancelling a
+  booking.
+- **PII in logs.** The worker logs transcripts and tool arguments at INFO for
+  debugging.
+- **Hang-up during a booking write**: the booking commits but the caller never
+  heard the confirmation. Nothing reconciles this, though the transcript and
+  post-call summary record it.
+- **Calls stay `in_progress`** if the worker process is killed before its
+  shutdown hook runs.
+- **No migrations.** Tables are created with `create_all`; schema changes need
+  a re-seed of the local database.
+- **Inventory is synthetic**: hourly slots per doctor for a rolling 14 days,
+  no service durations, no multi-slot treatments.
+- **Prices and hours are grounded by the prompt only** (see above); evals
+  sample behaviour, they don't prove it.
+- **Evals are text-only** and depend on a non-deterministic LLM; pass rates can
+  vary between runs, and free-tier LLM rate limits make a full run slow.
+- **Single seeded tenant.** `business_id` is on every table, but only one
+  business exists.
+- **LiveKit internals.** The custom TTS sentence splitting and per-reply
+  language switch reach into private attributes of the LiveKit Sarvam plugin
+  (`tts._opts`, `tokenize._basic_sent`), which may break on upgrades.
+- **Romanised Hinglish replies** sometimes come back in Devanagari.
 
----
+## Roadmap
 
-## 6. Future roadmap (not implemented — by design)
-
-These are documented, not built, to keep V0 minimal:
-
-1. **Twilio/Exotel/SIP telephony** — LiveKit supports SIP trunking; a real
-   phone number would connect to the same `AgentSession` pipeline, just via a
-   different room-input source instead of a browser mic.
-2. **PostgreSQL** — change `DATABASE_URL`; add Alembic migrations. Models
-   already use portable SQLAlchemy types.
-3. **pgvector / RAG** — implement `VectorKnowledgeProvider` alongside
-   `DatabaseKnowledgeProvider` in `app/business/service.py`; swap which one
-   `app/agent/agent.py` instantiates.
-4. **PDF uploads / website ingestion** — feed a document pipeline into the
-   same `VectorKnowledgeProvider`.
-5. **Google Calendar** — replace `app/tools/appointments.py`'s SQLite-backed
-   `check_availability`/`book_appointment` with Calendar API calls; keep the
-   same function signatures so `app/agent/agent.py` doesn't change.
-6. **HubSpot/Salesforce** — add a CRM sync step in `app/tools/customer.py`.
-7. **Multiple businesses** — already schema-ready; add a business picker to
-   the frontend and to the LiveKit room-name/token flow.
-8. **Customer authentication** — add auth middleware to `app/api/routes.py`.
-9. **Usage metering / Stripe billing** — track per-call/per-minute usage in a
-   new table, wire to Stripe metered billing.
-10. **Call recording storage** — `AgentSession`/LiveKit already support room
-    recording/egress; enable and point at S3-compatible storage.
-11. **Production monitoring** — the `metrics_collected` events already logged
-    here are the seam; export them to Prometheus/OpenTelemetry (LiveKit
-    Agents has built-in OTel support) instead of plain log lines.
-12. **Background jobs** — if post-call extraction volume grows, move it from
-    an inline shutdown callback to a proper queue.
-13. **Cloud deployment** — containerize `app/main.py` and `app/agent/agent.py`
-    separately; LiveKit Cloud can host the worker fleet directly.
-
----
-
-## WHAT YOU NEED TO DO MANUALLY
-
-1. Create/get a **LiveKit** project + API key/secret (<https://cloud.livekit.io>).
-2. Create/get a **Sarvam AI** API key (<https://dashboard.sarvam.ai>).
-3. Create/get an **OpenAI** API key (<https://platform.openai.com/api-keys>).
-4. Paste all of the above into `.env` (repo root).
-5. Run the setup script, then the three dev scripts (see Section 3).
-
-Everything else — venv, dependencies, database schema, seed data, tests — is
-already done for you by `scripts/setup.ps1` / `scripts/setup.sh`.
+1. Auth on the API and token endpoint; scrub PII from logs.
+2. Postgres + Alembic migrations.
+3. A short slot hold during confirmation, then deposits / payment links.
+4. A calendar or PMS adapter behind the same tool signatures.
+5. Booking provenance and an audit log of every booking change.
+6. Telephony via LiveKit SIP (same pipeline, phone instead of browser).
+7. Export latency and tool metrics to OpenTelemetry; run evals in CI, then
+   add recorded-audio evals for STT and barge-in.
+8. Reconcile bookings that were written but never confirmed to the caller.
