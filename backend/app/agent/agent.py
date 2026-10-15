@@ -16,6 +16,7 @@ import asyncio
 import functools
 import logging
 import sys
+import time
 from collections.abc import AsyncIterable, AsyncIterator, Callable
 from typing import TypeVar
 
@@ -41,7 +42,6 @@ from livekit.agents import (  # noqa: E402
     APIConnectOptions,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
     ModelSettings,
     RunContext,
     ToolError,
@@ -72,6 +72,7 @@ AUDIO_SAMPLE_RATE_IN = 16000
 AUDIO_SAMPLE_RATE_OUT = 24000
 
 from app.agent import audio_cache  # noqa: E402
+from app.agent.latency import LatencyRecorder  # noqa: E402
 from app.agent import session as call_session  # noqa: E402
 from app.agent.prompts import build_system_prompt  # noqa: E402
 from app.agent.state import SessionData  # noqa: E402
@@ -111,7 +112,7 @@ SESSION_CONN_OPTIONS = SessionConnectOptions(
 T = TypeVar("T")
 
 
-async def _run_db_tool(name: str, work: Callable[[], T]) -> T:
+async def _run_db_tool(name: str, work: Callable[[], T], latency: LatencyRecorder | None = None) -> T:
     """Run a tool's synchronous DB work off the event loop.
 
     Each tool's work is one `session_scope` transaction, so an exception means
@@ -119,6 +120,7 @@ async def _run_db_tool(name: str, work: Callable[[], T]) -> T:
     (a ToolError message reaches it verbatim) instead of a generic failure,
     so it apologises truthfully rather than guessing whether the booking went
     through."""
+    started = time.perf_counter()
     try:
         return await asyncio.to_thread(work)
     except Exception as exc:
@@ -127,6 +129,9 @@ async def _run_db_tool(name: str, work: Callable[[], T]) -> T:
             f"{name} hit an internal error and nothing was saved. Apologise, then offer to "
             "try again or to have a staff member call the caller back."
         ) from exc
+    finally:
+        if latency is not None:
+            latency.record_tool(name, time.perf_counter() - started)
 
 
 def _start_protected_write(context: RunContext[SessionData]) -> dict | None:
@@ -207,8 +212,9 @@ class Assistant(Agent):
     (see app/agent/prompts.py + the seeded Business row); this class only
     exposes the deterministic tool implementations."""
 
-    def __init__(self, *, instructions: str) -> None:
+    def __init__(self, *, instructions: str, latency: LatencyRecorder | None = None) -> None:
         super().__init__(instructions=instructions)
+        self.latency = latency
 
     async def tts_node(self, text: AsyncIterable[str], model_settings: ModelSettings):
         """Voice each reply in the language it is written in.
@@ -263,7 +269,7 @@ class Assistant(Agent):
                 )
 
         async with context.with_filler(AVAILABILITY_FILLER, delay=FILLER_DELAY):
-            result = await _run_db_tool("check_availability", _query)
+            result = await _run_db_tool("check_availability", _query, self.latency)
         logger.info("[tool] check_availability(%s, doctor=%s) -> %s", date, doctor, result)
         return result
 
@@ -309,7 +315,7 @@ class Assistant(Agent):
                 )
 
         async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
-            result = await _run_db_tool("book_appointment", _book)
+            result = await _run_db_tool("book_appointment", _book, self.latency)
         logger.info("[tool] book_appointment(%s) -> %s", customer_name, result)
         return result
 
@@ -353,7 +359,7 @@ class Assistant(Agent):
                 )
 
         async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
-            result = await _run_db_tool("book_group_appointment", _book)
+            result = await _run_db_tool("book_group_appointment", _book, self.latency)
         logger.info("[tool] book_group_appointment(%s) -> %s", patient_names, result)
         return result
 
@@ -373,7 +379,7 @@ class Assistant(Agent):
                     session, business_id=business_id, customer_phone=customer_phone
                 )
 
-        result = await _run_db_tool("find_appointments", _query)
+        result = await _run_db_tool("find_appointments", _query, self.latency)
         logger.info("[tool] find_appointments -> %d found", len(result.get("appointments", [])))
         return result
 
@@ -409,7 +415,7 @@ class Assistant(Agent):
                 )
 
         async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
-            result = await _run_db_tool("cancel_appointment", _cancel)
+            result = await _run_db_tool("cancel_appointment", _cancel, self.latency)
         logger.info("[tool] cancel_appointment -> success=%s", result.get("success"))
         return result
 
@@ -455,7 +461,7 @@ class Assistant(Agent):
                 )
 
         async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
-            result = await _run_db_tool("reschedule_appointment", _reschedule)
+            result = await _run_db_tool("reschedule_appointment", _reschedule, self.latency)
         logger.info("[tool] reschedule_appointment(%s %s) -> success=%s", new_date, new_time, result.get("success"))
         return result
 
@@ -494,7 +500,7 @@ class Assistant(Agent):
                     urgent=urgent,
                 )
 
-        result = await _run_db_tool("request_human_callback", _escalate)
+        result = await _run_db_tool("request_human_callback", _escalate, self.latency)
         logger.info("[tool] request_human_callback(urgent=%s) -> success=%s", urgent, result.get("success"))
         return result
 
@@ -514,7 +520,7 @@ class Assistant(Agent):
                 business = session.get(Business, business_id)
                 return appointment_tools.get_business_hours(business, day)
 
-        result = await _run_db_tool("get_business_hours", _query)
+        result = await _run_db_tool("get_business_hours", _query, self.latency)
         logger.info("[tool] get_business_hours(day=%s) -> %s", day, result)
         return result
 
@@ -532,7 +538,7 @@ class Assistant(Agent):
                 business = session.get(Business, business_id)
                 return appointment_tools.get_service_price(business, service)
 
-        result = await _run_db_tool("get_service_price", _query)
+        result = await _run_db_tool("get_service_price", _query, self.latency)
         logger.info("[tool] get_service_price(%s) -> %s", service, result)
         return result or {"error": f"No pricing information found for '{service}'."}
 
@@ -677,6 +683,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     call_id = await asyncio.to_thread(call_session.create_call, business_id, ctx.room.name)
     message_writer = call_session.CallMessageWriter(call_id)
+    latency = LatencyRecorder(call_id)
     logger.info("[call %s] starting session for room=%s agent=%s", call_id, ctx.room.name, agent_name)
 
     tts = sarvam.TTS(
@@ -727,24 +734,9 @@ async def entrypoint(ctx: JobContext) -> None:
         if role in ("user", "assistant") and text:
             message_writer.enqueue(role, text)
             logger.info("[call %s] %s: %s", call_id, role, text)
-
-    @session.on("metrics_collected")
-    def _on_metrics(ev: MetricsCollectedEvent) -> None:
-        m = ev.metrics
-        kind = getattr(m, "type", "unknown")
-        if kind == "stt_metrics":
-            logger.info("[call %s] latency stt duration=%.3fs", call_id, m.duration)
-        elif kind == "llm_metrics":
-            logger.info("[call %s] latency llm ttft=%.3fs duration=%.3fs", call_id, m.ttft, m.duration)
-        elif kind == "tts_metrics":
-            logger.info("[call %s] latency tts ttfb=%.3fs duration=%.3fs", call_id, m.ttfb, m.duration)
-        elif kind == "eou_metrics":
-            logger.info(
-                "[call %s] latency end-of-turn delay=%.3fs transcription_delay=%.3fs",
-                call_id,
-                m.end_of_utterance_delay,
-                m.transcription_delay,
-            )
+        # Per-turn latency, measured by LiveKit itself (see app/agent/latency.py).
+        for row in latency.record_turn(getattr(item, "metrics", None)):
+            logger.info("[call %s] latency %s=%.3fs", call_id, row["stage"], row["seconds"])
 
     @session.on("agent_state_changed")
     def _on_agent_state(ev) -> None:
@@ -791,6 +783,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # Flush pending transcript writes before closing the call out, so the
         # post-call extraction sees the complete transcript.
         await message_writer.aclose()
+        await latency.aflush()
         await asyncio.to_thread(call_session.end_call, call_id, call_status["value"])
         try:
             await run_post_call_extraction(call_id)
@@ -800,7 +793,7 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(_on_shutdown)
 
     await session.start(
-        agent=Assistant(instructions=instructions),
+        agent=Assistant(instructions=instructions, latency=latency),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
