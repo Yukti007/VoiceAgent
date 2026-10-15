@@ -36,3 +36,6 @@ Thumbs.db
 brag-output*/
 .agents/
 skills-lock.json
+
+# Per-run eval transcripts (the summary in evals/results/latest.md is kept)
+backend/evals/results/transcripts/
