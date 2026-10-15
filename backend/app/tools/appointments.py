@@ -243,9 +243,14 @@ def book_appointment(
     service: str,
     doctor: str | None = None,
     now: datetime | None = None,
+    preview: bool = False,
 ) -> dict:
     """Actually reserve a slot and create an Appointment row. Never invents
-    availability -- fails with success=False if the slot doesn't exist or is booked."""
+    availability -- fails with success=False if the slot doesn't exist or is booked.
+
+    With preview=True, runs every check (including that a slot is open) but
+    claims nothing, and returns the normalised details to read back to the
+    caller plus a `confirmation_key` identifying exactly this booking."""
     try:
         parsed_date = _parse_iso_date(date)
         parsed_time = _parse_time(time)
@@ -272,14 +277,20 @@ def book_appointment(
     if existing is not None:
         return _booking_result(existing, existing.customer.name, already_booked=True)
 
-    slot = None
-    for candidate in _find_candidate_slots(
+    candidates = _find_candidate_slots(
         session,
         business_id=business_id,
         date=parsed_date.isoformat(),
         time=parsed_time,
         doctor=doctor,
-    ):
+    )
+    if preview and candidates:
+        return _read_back(
+            [customer_name.strip()], customer_phone, parsed_date, parsed_time, service, doctor, "book_appointment"
+        )
+
+    slot = None
+    for candidate in [] if preview else candidates:
         if _claim_slot(session, candidate.id):
             slot = candidate
             break
@@ -326,10 +337,14 @@ def book_group_appointment(
     time: str,
     service: str,
     now: datetime | None = None,
+    preview: bool = False,
 ) -> dict:
     """Book several people (e.g. a parent and child) at the same date/time,
     one slot each, all-or-nothing: if there aren't enough open slots for
-    everyone, nothing is booked and the caller can pick another time."""
+    everyone, nothing is booked and the caller can pick another time.
+
+    preview=True checks everything and returns the read-back without
+    claiming, as in `book_appointment`."""
     try:
         parsed_date = _parse_iso_date(date)
         parsed_time = _parse_time(time)
@@ -367,10 +382,16 @@ def book_group_appointment(
         else:
             pending.append(name)
 
-    claimed: list[AppointmentSlot] = []
-    for candidate in _find_candidate_slots(
+    candidates = _find_candidate_slots(
         session, business_id=business_id, date=iso_date, time=parsed_time, doctor=None
-    ):
+    )
+    if preview and pending and len(candidates) >= len(pending):
+        return _read_back(pending, customer_phone, parsed_date, parsed_time, service, None, "book_group_appointment")
+    if not pending:
+        return {"success": True, "date": iso_date, "time": parsed_time, "appointments": booked}
+
+    claimed: list[AppointmentSlot] = []
+    for candidate in [] if preview else candidates:
         if len(claimed) == len(pending):
             break
         if _claim_slot(session, candidate.id):
@@ -387,7 +408,7 @@ def book_group_appointment(
         return {
             "success": False,
             "error": (
-                f"Only {len(claimed)} open slot(s) on {iso_date} at {parsed_time}, "
+                f"Only {len(candidates) if preview else len(claimed)} open slot(s) on {iso_date} at {parsed_time}, "
                 f"but {len(pending)} needed. Nothing was booked. Offer another time, "
                 "or book them at back-to-back times with book_appointment."
             ),
@@ -602,6 +623,30 @@ def _release_slot(session: Session, appointment: Appointment) -> None:
         .values(is_booked=False)
         .execution_options(synchronize_session=False)
     )
+
+
+def _read_back(
+    names: list[str], phone: str, day: date_cls, time: str, service: str, doctor: str | None, tool: str
+) -> dict:
+    key = "|".join([",".join(sorted(n.lower() for n in names)), phone, day.isoformat(), time, service, doctor or ""])
+    return {
+        "success": False,
+        "requires_confirmation": True,
+        "confirmation_key": key,
+        "read_back": {
+            "names": names,
+            "phone_digits": " ".join(phone),
+            "date": day.isoformat(),
+            "weekday": WEEKDAY_NAMES[day.weekday()],
+            "time": time,
+            "service": service,
+            "doctor": doctor or "any available doctor",
+        },
+        "next_step": (
+            "Not booked yet. Read these details back to the caller, the phone number digit by digit, "
+            f"and ask them to confirm. When they confirm, call {tool} again with exactly the same details."
+        ),
+    }
 
 
 def _appointment_fields(appointment: Appointment, customer_name: str) -> dict:

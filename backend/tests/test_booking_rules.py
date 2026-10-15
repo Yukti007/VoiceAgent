@@ -221,3 +221,38 @@ async def test_db_errors_reach_the_llm_as_a_truthful_tool_error():
     with pytest.raises(ToolError) as excinfo:
         await _run_db_tool("book_appointment", broken)
     assert "nothing was saved" in str(excinfo.value)
+
+
+# ---- preview (read-back) mode -------------------------------------------
+
+
+def test_preview_validates_but_claims_nothing(business_id):
+    day = _future_weekday(5)
+    time = _open_time(business_id, day, both_doctors=True)
+    preview = _book(business_id, customer_phone="+91 90000 22222", date=day, time=time, preview=True)
+    assert preview["requires_confirmation"] is True
+    assert preview["read_back"]["phone_digits"] == "9 0 0 0 0 2 2 2 2 2"
+    assert time in _open_time_list(business_id, day)
+    with session_scope() as session:
+        assert session.query(Customer).filter(Customer.phone == "9000022222").count() == 0
+
+    with session_scope() as session:
+        group = book_group_appointment(
+            session,
+            business_id=business_id,
+            customer_phone="9000022223",
+            patient_names=["P One", "P Two"],
+            date=day,
+            time=time,
+            service="Consultation",
+            preview=True,
+        )
+    assert group["requires_confirmation"] is True and group["read_back"]["names"] == ["P One", "P Two"]
+    with session_scope() as session:
+        both = [s for s in check_availability(session, business_id=business_id, date=day)["available"] if s["time"] == time]
+    assert len(both) == 2  # both doctors still free
+
+
+def _open_time_list(business_id: str, date: str) -> list[str]:
+    with session_scope() as session:
+        return sorted({s["time"] for s in check_availability(session, business_id=business_id, date=date)["available"]})

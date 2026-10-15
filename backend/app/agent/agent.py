@@ -152,6 +152,13 @@ def _start_protected_write(context: RunContext[SessionData]) -> dict | None:
     return None
 
 
+def _caller_turns(agent: Agent) -> int:
+    """How many times the caller has spoken so far in this conversation."""
+    return sum(
+        1 for item in agent.chat_ctx.items if getattr(item, "type", None) == "message" and item.role == "user"
+    )
+
+
 # How much of a reply to read before choosing the TTS language for it.
 _TTS_LANGUAGE_PEEK_LETTERS = 12
 
@@ -247,6 +254,34 @@ class Assistant(Agent):
         async for frame in Agent.default.tts_node(self, _replay(), model_settings):
             yield frame
 
+    async def _book_after_read_back(
+        self, context: RunContext[SessionData], name: str, book: Callable[[bool], dict]
+    ) -> dict:
+        """Make reading the booking back to the caller a step the code enforces.
+
+        A live call showed the model booking straight from what STT heard,
+        without confirming -- a misheard phone number becomes a real booking.
+        So the first call is a preview (every check, nothing claimed) that
+        returns the details to read back; the booking commits only when the
+        same details come back on a later caller turn, i.e. after the caller
+        has had a chance to say yes or correct them."""
+        preview = await _run_db_tool(name, lambda: book(True), self.latency)
+        if not preview.get("requires_confirmation"):
+            return preview  # a validation error, or already booked
+        key = preview.pop("confirmation_key")
+        turn = _caller_turns(self)
+        read_back_at = context.userdata.read_backs.setdefault(key, turn)
+        if read_back_at >= turn:
+            return preview
+
+        if (refused := _start_protected_write(context)) is not None:
+            return refused
+        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
+            result = await _run_db_tool(name, lambda: book(False), self.latency)
+        if result.get("success"):
+            context.userdata.read_backs.pop(key, None)
+        return result
+
     @function_tool()
     async def check_availability(
         self,
@@ -284,9 +319,10 @@ class Assistant(Agent):
         service: str,
         doctor: str | None = None,
     ) -> dict:
-        """Book a real appointment at Sharma Dental Care. Only call this after the caller
-        has confirmed name, phone, service, date and time, and after check_availability
-        has shown the slot as open.
+        """Book a real appointment at Sharma Dental Care, after check_availability has
+        shown the slot as open. Works in two steps: the first call returns
+        requires_confirmation with the details to read back; once the caller confirms
+        them, call again with exactly the same details to book.
 
         Args:
             customer_name: Caller's full name.
@@ -296,12 +332,9 @@ class Assistant(Agent):
             service: Service being booked, e.g. "Consultation" or "Teeth whitening".
             doctor: Optional preferred doctor's name.
         """
-        if (refused := _start_protected_write(context)) is not None:
-            return refused
-
         business_id = context.userdata.business_id
 
-        def _book() -> dict:
+        def _book(preview: bool) -> dict:
             with session_scope() as session:
                 return appointment_tools.book_appointment(
                     session,
@@ -312,10 +345,10 @@ class Assistant(Agent):
                     time=time,
                     service=service,
                     doctor=doctor,
+                    preview=preview,
                 )
 
-        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
-            result = await _run_db_tool("book_appointment", _book, self.latency)
+        result = await self._book_after_read_back(context, "book_appointment", _book)
         logger.info("[tool] book_appointment(%s) -> %s", customer_name, result)
         return result
 
@@ -331,7 +364,8 @@ class Assistant(Agent):
     ) -> dict:
         """Book the same date and time for several people at once, e.g. a caller and
         their child. Use instead of book_appointment whenever more than one person
-        needs an appointment. Books everyone or no one.
+        needs an appointment. Books everyone or no one. Two steps, like book_appointment:
+        read back the returned details, then call again with the same details.
 
         Args:
             patient_names: Full name of each person to book, including the caller if
@@ -341,12 +375,9 @@ class Assistant(Agent):
             time: 24-hour time HH:MM.
             service: Service being booked, e.g. "Dental cleaning".
         """
-        if (refused := _start_protected_write(context)) is not None:
-            return refused
-
         business_id = context.userdata.business_id
 
-        def _book() -> dict:
+        def _book(preview: bool) -> dict:
             with session_scope() as session:
                 return appointment_tools.book_group_appointment(
                     session,
@@ -356,10 +387,10 @@ class Assistant(Agent):
                     date=date,
                     time=time,
                     service=service,
+                    preview=preview,
                 )
 
-        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
-            result = await _run_db_tool("book_group_appointment", _book, self.latency)
+        result = await self._book_after_read_back(context, "book_group_appointment", _book)
         logger.info("[tool] book_group_appointment(%s) -> %s", patient_names, result)
         return result
 
