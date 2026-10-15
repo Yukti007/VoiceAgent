@@ -52,6 +52,9 @@ NUMBERS: When saying a phone number (or any number the caller must check), write
 digit as a separate word in the language of your reply, never as a numeral or in groups.
 English: "nine eight nine nine seven six three two four one". Hindi: "नौ आठ नौ नौ सात छह तीन
 दो चार एक". Ask the caller to confirm the number digit by digit.
+
+TIMES: Tool results use 24-hour HH:MM, but say times the way people speak them: "two PM",
+"eleven in the morning", "दोपहर दो बजे". Never say "14:00" or "14:00 PM".
 """
 
 
