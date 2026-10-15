@@ -17,7 +17,7 @@ import logging
 from datetime import datetime
 
 from app.database.database import session_scope
-from app.database.models import Call, CallMessage
+from app.database.models import Call, CallMessage, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ def add_call_message(
                 call_id=call_id,
                 role=role,
                 text=text,
-                timestamp=timestamp or datetime.utcnow(),
+                timestamp=timestamp or utcnow(),
             )
         )
 
@@ -55,7 +55,7 @@ def end_call(call_id: str, status: str = "completed") -> None:
         if call is None:
             logger.warning("end_call: call %s not found", call_id)
             return
-        call.ended_at = datetime.utcnow()
+        call.ended_at = utcnow()
         call.status = status
         if call.started_at:
             call.duration_seconds = int((call.ended_at - call.started_at).total_seconds())
@@ -80,7 +80,7 @@ class CallMessageWriter:
     def enqueue(self, role: str, text: str) -> None:
         if not (text or "").strip():
             return
-        self._queue.put_nowait((role, text, datetime.utcnow()))
+        self._queue.put_nowait((role, text, utcnow()))
 
     async def _run(self) -> None:
         while True:

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,21 +34,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Voice Agent V0 API", version="0.1.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(router)
-
-
-@app.on_event("startup")
-def on_startup() -> None:
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     ensure_dirs()
     init_db()
     missing = settings.missing_credentials()
@@ -58,6 +48,20 @@ def on_startup() -> None:
         )
     else:
         logger.info("All required credentials are configured.")
+    yield
+
+
+app = FastAPI(title="Voice Agent V0 API", version="0.1.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
 
 
 @app.get("/")
