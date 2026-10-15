@@ -9,18 +9,24 @@ Keeping the logic here (instead of inline in the agent) means:
   - `book_appointment` only ever reports success after a real SQLite write
   - two concurrent callers can never both get the same slot: claiming a slot
     is a single conditional UPDATE (see `_claim_slot`), not read-then-write
+  - inputs the LLM passes are checked against the business's own data (past
+    times, the booking window, the service catalogue, the doctor list, phone
+    format) and rejected with an error message the LLM can act on
 """
 
 from __future__ import annotations
 
+import re
 from datetime import date as date_cls
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from app.business.clock import business_now
 from app.database.models import Appointment, AppointmentSlot, Business, Customer
-from app.tools.customer import get_or_create_customer, get_or_create_household_member
+from app.database.seed import AVAILABILITY_DAYS
+from app.tools.customer import InvalidPhoneError, get_or_create_customer, normalize_phone
 
 WEEKDAY_NAMES = [
     "monday",
@@ -57,6 +63,92 @@ def _parse_time(time_str: str) -> str:
     raise InvalidDateError(f"'{time_str}' is not a recognizable time (expected e.g. '14:00' or '2:00 PM')")
 
 
+class BookingRuleError(ValueError):
+    """A request the business can't accept (past time, unknown service, ...).
+    The message is written for the LLM to relay or act on."""
+
+
+def match_service(business: Business, service: str) -> dict | None:
+    """Resolve a spoken service name to a catalogue entry, or None.
+
+    Exact, then substring ("cleaning" -> "Dental cleaning"), then a word that
+    names exactly one service. Ambiguous input ("teeth cleaning" fits both
+    whitening and cleaning) returns None so the agent asks instead of guessing."""
+    services = (business.business_knowledge or {}).get("services", [])
+    needle = service.strip().lower()
+    if not needle:
+        return None
+    for svc in services:
+        if svc["name"].lower() == needle:
+            return svc
+    hits = [svc for svc in services if needle in svc["name"].lower() or svc["name"].lower() in needle]
+    if len(hits) == 1:
+        return hits[0]
+    words = {w for w in re.findall(r"[a-z]+", needle) if len(w) >= 4}
+    hits = [svc for svc in services if words & set(svc["name"].lower().split())]
+    return hits[0] if len(hits) == 1 else None
+
+
+_DOCTOR_FILLER_WORDS = {"dr", "doctor", "ji", "sir", "madam", "maam"}
+
+
+def _name_words(name: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z]+", name.lower()) if w not in _DOCTOR_FILLER_WORDS}
+
+
+def resolve_doctor(business: Business, doctor: str | None) -> str | None:
+    """Map "Dr. Sharma" / "Neha ji" to the full name on file. None means
+    "any doctor". Raises BookingRuleError for an unknown or ambiguous name --
+    an exact-match filter used to turn "Dr. Sharma" into "fully booked"."""
+    if doctor is None or not doctor.strip():
+        return None
+    doctors: list[str] = (business.business_knowledge or {}).get("doctors", [])
+    wanted = _name_words(doctor)
+    matches = [d for d in doctors if wanted and wanted <= _name_words(d)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise BookingRuleError(f"There is no doctor named '{doctor}'. Doctors: {', '.join(doctors)}.")
+    raise BookingRuleError(f"'{doctor}' could mean {' or '.join(matches)}. Ask the caller which one.")
+
+
+def _resolve_service(business: Business, service: str) -> str:
+    match = match_service(business, service)
+    if match is None:
+        names = ", ".join(s["name"] for s in (business.business_knowledge or {}).get("services", []))
+        raise BookingRuleError(f"'{service}' is not a service offered here. Services: {names}.")
+    return match["name"]
+
+
+def _check_date_bookable(day: date_cls, now: datetime) -> None:
+    today = now.date()
+    if day < today:
+        raise BookingRuleError(
+            f"{day.isoformat()} is in the past (today is {today.isoformat()}). Ask for a future date."
+        )
+    last = today + timedelta(days=AVAILABILITY_DAYS - 1)
+    if day > last:
+        raise BookingRuleError(
+            f"Appointments can only be booked up to {last.isoformat()} ({AVAILABILITY_DAYS} days ahead)."
+        )
+
+
+def _check_slot_bookable(day: date_cls, time: str, now: datetime) -> None:
+    _check_date_bookable(day, now)
+    if day == now.date() and time <= now.strftime("%H:%M"):
+        raise BookingRuleError(
+            f"{time} today has already passed (it is {now.strftime('%H:%M')} at the clinic). "
+            "Offer a later time."
+        )
+
+
+def _load_business(session: Session, business_id: str) -> Business:
+    business = session.get(Business, business_id)
+    if business is None:
+        raise BookingRuleError(f"Unknown business '{business_id}'.")
+    return business
+
+
 def get_business_hours(business: Business, day: str | None = None) -> dict:
     """Return opening hours. If `day` is given (e.g. 'monday' or 'Thursday'),
     returns just that day's hours; otherwise the full week."""
@@ -70,23 +162,29 @@ def get_business_hours(business: Business, day: str | None = None) -> dict:
 
 
 def get_service_price(business: Business, service: str) -> dict | None:
-    """Fuzzy (case-insensitive substring) match against the seeded service list."""
-    services = (business.business_knowledge or {}).get("services", [])
-    needle = service.strip().lower()
-    for svc in services:
-        if needle in svc["name"].lower() or svc["name"].lower() in needle:
-            return {
-                "service": svc["name"],
-                "price_inr": svc["price_inr"],
-                "starting_at": svc.get("starting_at", False),
-            }
-    return None
+    """Price for a service, matched the same way bookings match services."""
+    svc = match_service(business, service)
+    if svc is None:
+        return None
+    return {
+        "service": svc["name"],
+        "price_inr": svc["price_inr"],
+        "starting_at": svc.get("starting_at", False),
+    }
 
 
 def check_availability(
-    session: Session, *, business_id: str, date: str, doctor: str | None = None
+    session: Session,
+    *,
+    business_id: str,
+    date: str,
+    doctor: str | None = None,
+    now: datetime | None = None,
 ) -> dict:
     """Query real generated availability for a given ISO date.
+
+    Only future slots are returned: on today's date, times that have already
+    passed at the clinic are left out.
 
     Returns:
         {"date": "2026-09-16", "available": [{"doctor": "...", "time": "09:00"}, ...]}
@@ -94,7 +192,11 @@ def check_availability(
     """
     try:
         parsed = _parse_iso_date(date)
-    except InvalidDateError as exc:
+        business = _load_business(session, business_id)
+        now = now or business_now(business)
+        _check_date_bookable(parsed, now)
+        doctor = resolve_doctor(business, doctor)
+    except (InvalidDateError, BookingRuleError) as exc:
         return {"date": date, "available": [], "error": str(exc)}
 
     query = select(AppointmentSlot).where(
@@ -104,6 +206,8 @@ def check_availability(
     )
     if doctor:
         query = query.where(AppointmentSlot.doctor == doctor)
+    if parsed == now.date():
+        query = query.where(AppointmentSlot.time > now.strftime("%H:%M"))
     query = query.order_by(AppointmentSlot.time, AppointmentSlot.doctor)
 
     slots = session.execute(query).scalars().all()
@@ -138,13 +242,21 @@ def book_appointment(
     time: str,
     service: str,
     doctor: str | None = None,
+    now: datetime | None = None,
 ) -> dict:
     """Actually reserve a slot and create an Appointment row. Never invents
     availability -- fails with success=False if the slot doesn't exist or is booked."""
     try:
         parsed_date = _parse_iso_date(date)
         parsed_time = _parse_time(time)
-    except InvalidDateError as exc:
+        customer_phone = normalize_phone(customer_phone)
+        if not customer_name.strip():
+            raise BookingRuleError("The caller's name is required.")
+        business = _load_business(session, business_id)
+        _check_slot_bookable(parsed_date, parsed_time, now or business_now(business))
+        service = _resolve_service(business, service)
+        doctor = resolve_doctor(business, doctor)
+    except (InvalidDateError, InvalidPhoneError, BookingRuleError) as exc:
         return {"success": False, "error": str(exc)}
 
     # Idempotency: if this caller already holds a confirmed appointment at
@@ -213,6 +325,7 @@ def book_group_appointment(
     date: str,
     time: str,
     service: str,
+    now: datetime | None = None,
 ) -> dict:
     """Book several people (e.g. a parent and child) at the same date/time,
     one slot each, all-or-nothing: if there aren't enough open slots for
@@ -220,7 +333,11 @@ def book_group_appointment(
     try:
         parsed_date = _parse_iso_date(date)
         parsed_time = _parse_time(time)
-    except InvalidDateError as exc:
+        customer_phone = normalize_phone(customer_phone)
+        business = _load_business(session, business_id)
+        _check_slot_bookable(parsed_date, parsed_time, now or business_now(business))
+        service = _resolve_service(business, service)
+    except (InvalidDateError, InvalidPhoneError, BookingRuleError) as exc:
         return {"success": False, "error": str(exc)}
 
     names: list[str] = []
@@ -277,7 +394,7 @@ def book_group_appointment(
         }
 
     for name, slot in zip(pending, claimed):
-        customer = get_or_create_household_member(
+        customer = get_or_create_customer(
             session, business_id=business_id, name=name, phone=customer_phone
         )
         appointment = Appointment(

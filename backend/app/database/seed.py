@@ -14,6 +14,7 @@ import logging
 import random
 from datetime import date, timedelta
 
+from app.business.clock import DEFAULT_TIMEZONE, business_today
 from app.config import get_settings
 from app.database.database import init_db, session_scope
 from app.database.models import Appointment, AppointmentSlot, Business, Customer
@@ -54,6 +55,7 @@ SERVICES = [
 ]
 
 BUSINESS_KNOWLEDGE = {
+    "timezone": DEFAULT_TIMEZONE,
     "hours": HOURS_DISPLAY,
     "services": SERVICES,
     "doctors": DOCTORS,
@@ -110,7 +112,7 @@ def _generate_slots_for_business(session, business_id: str) -> int:
     session.query(AppointmentSlot).filter(AppointmentSlot.business_id == business_id).delete()
 
     rng = random.Random(RNG_SEED)
-    today = date.today()
+    today = business_today(session.get(Business, business_id))
     return sum(
         _add_slots_for_day(session, business_id, today + timedelta(days=offset), rng)
         for offset in range(AVAILABILITY_DAYS)
@@ -145,7 +147,7 @@ def ensure_availability(session, business_id: str) -> int:
     """Top up the rolling AVAILABILITY_DAYS window without touching existing
     slots or bookings. The one-off seed only covers the 14 days after it ran,
     so without this every date past that silently became unbookable."""
-    today = date.today()
+    today = business_today(session.get(Business, business_id))
     window = [(today + timedelta(days=offset)).isoformat() for offset in range(AVAILABILITY_DAYS)]
     covered = {
         d

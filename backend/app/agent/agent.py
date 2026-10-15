@@ -16,7 +16,8 @@ import asyncio
 import functools
 import logging
 import sys
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator, Callable
+from typing import TypeVar
 
 from dotenv import load_dotenv
 
@@ -43,6 +44,7 @@ from livekit.agents import (  # noqa: E402
     MetricsCollectedEvent,
     ModelSettings,
     RunContext,
+    ToolError,
     WorkerOptions,
     cli,
     function_tool,
@@ -103,6 +105,27 @@ SESSION_CONN_OPTIONS = SessionConnectOptions(
     llm_conn_options=APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=5.0),
     tts_conn_options=APIConnectOptions(max_retry=2, retry_interval=0.5, timeout=5.0),
 )
+
+
+T = TypeVar("T")
+
+
+async def _run_db_tool(name: str, work: Callable[[], T]) -> T:
+    """Run a tool's synchronous DB work off the event loop.
+
+    Each tool's work is one `session_scope` transaction, so an exception means
+    it was rolled back: nothing half-written. Say exactly that to the LLM
+    (a ToolError message reaches it verbatim) instead of a generic failure,
+    so it apologises truthfully rather than guessing whether the booking went
+    through."""
+    try:
+        return await asyncio.to_thread(work)
+    except Exception as exc:
+        logger.exception("[tool] %s failed", name)
+        raise ToolError(
+            f"{name} hit an internal error and nothing was saved. Apologise, then offer to "
+            "try again or to have a staff member call the caller back."
+        ) from exc
 
 
 # How much of a reply to read before choosing the TTS language for it.
@@ -221,7 +244,7 @@ class Assistant(Agent):
                 )
 
         async with context.with_filler(AVAILABILITY_FILLER, delay=FILLER_DELAY):
-            result = await asyncio.to_thread(_query)
+            result = await _run_db_tool("check_availability", _query)
         logger.info("[tool] check_availability(%s, doctor=%s) -> %s", date, doctor, result)
         return result
 
@@ -277,7 +300,7 @@ class Assistant(Agent):
                 )
 
         async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
-            result = await asyncio.to_thread(_book)
+            result = await _run_db_tool("book_appointment", _book)
         logger.info("[tool] book_appointment(%s) -> %s", customer_name, result)
         return result
 
@@ -301,7 +324,7 @@ class Assistant(Agent):
             customer_phone: Contact phone number shared by the group.
             date: ISO date YYYY-MM-DD.
             time: 24-hour time HH:MM.
-            service: Service being booked, e.g. "Teeth cleaning".
+            service: Service being booked, e.g. "Dental cleaning".
         """
         try:
             context.disallow_interruptions()
@@ -326,7 +349,7 @@ class Assistant(Agent):
                 )
 
         async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
-            result = await asyncio.to_thread(_book)
+            result = await _run_db_tool("book_group_appointment", _book)
         logger.info("[tool] book_group_appointment(%s) -> %s", patient_names, result)
         return result
 
@@ -346,7 +369,7 @@ class Assistant(Agent):
                 business = session.get(Business, business_id)
                 return appointment_tools.get_business_hours(business, day)
 
-        result = await asyncio.to_thread(_query)
+        result = await _run_db_tool("get_business_hours", _query)
         logger.info("[tool] get_business_hours(day=%s) -> %s", day, result)
         return result
 
@@ -364,7 +387,7 @@ class Assistant(Agent):
                 business = session.get(Business, business_id)
                 return appointment_tools.get_service_price(business, service)
 
-        result = await asyncio.to_thread(_query)
+        result = await _run_db_tool("get_service_price", _query)
         logger.info("[tool] get_service_price(%s) -> %s", service, result)
         return result or {"error": f"No pricing information found for '{service}'."}
 

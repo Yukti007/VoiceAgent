@@ -1,4 +1,6 @@
-from datetime import date, timedelta
+from datetime import timedelta
+
+from app.business.clock import business_today
 
 from app.database.database import session_scope
 from app.database.models import Appointment, AppointmentSlot
@@ -9,9 +11,10 @@ from app.database.models import Business
 def _first_weekday_with_availability(business_id: str) -> str:
     """Find a date within the seeded window that actually has an open slot,
     regardless of the random pre-booked pattern."""
-    today = date.today()
+    # From tomorrow: today's earlier slots are (correctly) no longer bookable.
+    today = business_today(None)
     with session_scope() as session:
-        for offset in range(14):
+        for offset in range(1, 14):
             d = (today + timedelta(days=offset)).isoformat()
             has_open = (
                 session.query(AppointmentSlot)
@@ -220,9 +223,10 @@ def test_book_appointment_is_idempotent_for_same_caller_and_slot(business_id):
 
 def _time_with_open_slots(business_id: str, needed: int) -> tuple[str, str, list[int]]:
     """A (date, time) with at least `needed` open slots, plus those slot ids."""
-    today = date.today()
+    # From tomorrow: today's earlier slots are (correctly) no longer bookable.
+    today = business_today(None)
     with session_scope() as session:
-        for offset in range(14):
+        for offset in range(1, 14):
             d = (today + timedelta(days=offset)).isoformat()
             slots = (
                 session.query(AppointmentSlot)

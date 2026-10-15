@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+from app.business.clock import business_now
 from app.database.models import Business
 
 TOOL_USAGE_RULES = """
@@ -52,10 +53,11 @@ def _calendar(today: date, days: int = 14) -> str:
 
 
 def build_system_prompt(business: Business, knowledge_context: str) -> str:
-    today = date.today()
+    now = business_now(business)
+    today = now.date()
     return f"""{business.system_instructions}
 {LANGUAGE_RULE}
-Today's date is {today.isoformat()} ({today.strftime("%A")}).
+Today's date is {today.isoformat()} ({today.strftime("%A")}); the time at the clinic is {now.strftime("%H:%M")}.
 {_calendar(today)}
 {TOOL_USAGE_RULES}
 

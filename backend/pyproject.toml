@@ -17,6 +17,8 @@ dependencies = [
     "python-dotenv>=1.2,<2",
     "openai>=2.54,<3",
     "httpx>=0.28,<1",
+    # zoneinfo has no timezone database on Windows without this.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
