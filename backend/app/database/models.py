@@ -174,3 +174,22 @@ class CallExtraction(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     call: Mapped[Call] = relationship(back_populates="extraction")
+
+
+class Escalation(Base):
+    """A request for a human to call the caller back, raised by the agent when
+    it can't or shouldn't handle something itself (emergency, complaint,
+    question outside its knowledge, or the caller simply asks for a person)."""
+
+    __tablename__ = "escalations"
+    __table_args__ = (Index("ix_escalations_business_status", "business_id", "status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    business_id: Mapped[str] = mapped_column(ForeignKey("businesses.id"), nullable=False)
+    call_id: Mapped[str | None] = mapped_column(ForeignKey("calls.id"), nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    customer_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    urgent: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(32), default="open")  # open | resolved
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

@@ -80,6 +80,7 @@ from app.database.seed import ensure_availability  # noqa: E402
 from app.llm.provider import get_agent_llm_with_fallback  # noqa: E402
 from app.postcall.extractor import run_post_call_extraction  # noqa: E402
 from app.tools import appointments as appointment_tools  # noqa: E402
+from app.tools import escalation as escalation_tools  # noqa: E402
 
 logger = logging.getLogger("voice_agent.worker")
 
@@ -456,6 +457,45 @@ class Assistant(Agent):
         async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
             result = await _run_db_tool("reschedule_appointment", _reschedule)
         logger.info("[tool] reschedule_appointment(%s %s) -> success=%s", new_date, new_time, result.get("success"))
+        return result
+
+    @function_tool()
+    async def request_human_callback(
+        self,
+        context: RunContext[SessionData],
+        reason: str,
+        customer_phone: str | None = None,
+        customer_name: str | None = None,
+        urgent: bool = False,
+    ) -> dict:
+        """Ask a staff member to call the caller back. Use when the caller asks for a person,
+        has a complaint or billing question, describes a dental emergency (after telling them
+        to seek urgent care), asks something your business knowledge does not cover, or a
+        tool keeps failing. Do not promise a specific callback time.
+
+        Args:
+            reason: One short sentence a staff member can act on.
+            customer_phone: Number to call back on, if the caller gives one.
+            customer_name: Caller's name, if known.
+            urgent: True for emergencies or a caller in pain.
+        """
+        business_id = context.userdata.business_id
+        call_id = context.userdata.call_id
+
+        def _escalate() -> dict:
+            with session_scope() as session:
+                return escalation_tools.request_human_callback(
+                    session,
+                    business_id=business_id,
+                    call_id=call_id,
+                    reason=reason,
+                    customer_phone=customer_phone,
+                    customer_name=customer_name,
+                    urgent=urgent,
+                )
+
+        result = await _run_db_tool("request_human_callback", _escalate)
+        logger.info("[tool] request_human_callback(urgent=%s) -> success=%s", urgent, result.get("success"))
         return result
 
     @function_tool()

@@ -11,7 +11,7 @@ from app.database.models import Business
 TOOL_USAGE_RULES = """
 You have these tools available: check_availability, book_appointment,
 book_group_appointment, find_appointments, cancel_appointment, reschedule_appointment,
-get_business_hours, get_service_price. Rules for using them:
+request_human_callback, get_business_hours, get_service_price. Rules for using them:
 - Always call check_availability before telling the caller which specific times are open.
   Never invent or guess a time slot.
 - Always call book_appointment before telling the caller a booking is confirmed. If it
@@ -33,6 +33,11 @@ get_business_hours, get_service_price. Rules for using them:
   nothing has changed yet. Explain the late-change policy, and only if the caller still
   wants to go ahead, call it again with accept_late_policy=true.
 - Never read an appointment_id aloud.
+- Hand off instead of improvising: if the caller asks for a person, has a complaint or a
+  billing question, asks something your business knowledge does not cover, or a tool keeps
+  failing, offer a staff callback and use request_human_callback. For a dental emergency,
+  first tell them to seek urgent care, then raise an urgent callback. Never give medical
+  advice or diagnoses.
 - Only call a tool when the caller's request needs it. Do not look up prices or hours
   nobody asked about.
 """
