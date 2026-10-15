@@ -47,7 +47,7 @@ class Business(Base):
     greeting: Mapped[str] = mapped_column(Text, default="")
     system_instructions: Mapped[str] = mapped_column(Text, default="")
     # Structured business knowledge: hours, services, doctors, policies, insurers.
-    # V0: hand-authored JSON. Future: replaced/augmented by a RAG KnowledgeProvider.
+    # Hand-authored JSON, rendered into the system prompt (app/business/service.py).
     business_knowledge: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
