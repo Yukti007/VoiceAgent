@@ -63,3 +63,18 @@ def test_tts_language_follows_the_reply_script_not_the_caller():
     assert tts_language_for("Sorry, mujhe thodi dikkat aa gayi") == "en-IN"
     assert tts_language_for("Great! क्या आप हमें अपना फोन नंबर दे सकते हैं") == "hi-IN"
     assert tts_language_for("3242 6872") is None
+
+
+async def test_hindi_replies_reach_tts_one_sentence_at_a_time():
+    from app.agent.agent import IndicSentenceTokenizer
+
+    reply = "बहुत अच्छा! सोमवार को तीन बजे स्लॉट खाली है। क्या आप अपना नाम बता सकती हैं?"
+    stream = IndicSentenceTokenizer().stream()
+    stream.push_text(reply)
+    stream.end_input()
+    sentences = [s.token async for s in stream]
+    assert sentences == [
+        "बहुत अच्छा!",
+        "सोमवार को तीन बजे स्लॉट खाली है।",
+        "क्या आप अपना नाम बता सकती हैं?",
+    ]

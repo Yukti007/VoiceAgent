@@ -8,7 +8,7 @@ no model rewrites should be required.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import (
     Boolean,
@@ -26,6 +26,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 def _uuid() -> str:
     return uuid.uuid4().hex
+
+
+def utcnow() -> datetime:
+    """Naive UTC timestamp, as stored in the DateTime columns below."""
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
@@ -47,11 +52,11 @@ class Business(Base):
     greeting: Mapped[str] = mapped_column(Text, default="")
     system_instructions: Mapped[str] = mapped_column(Text, default="")
     # Structured business knowledge: hours, services, doctors, policies, insurers.
-    # V0: hand-authored JSON. Future: replaced/augmented by a RAG KnowledgeProvider.
+    # Hand-authored JSON, rendered into the system prompt (app/business/service.py).
     business_knowledge: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utcnow, onupdate=utcnow
     )
 
     calls: Mapped[list["Call"]] = relationship(back_populates="business")
@@ -69,7 +74,7 @@ class Customer(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     business: Mapped[Business] = relationship(back_populates="customers")
     appointments: Mapped[list["Appointment"]] = relationship(back_populates="customer")
@@ -82,7 +87,7 @@ class Call(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     business_id: Mapped[str] = mapped_column(ForeignKey("businesses.id"), nullable=False)
     room_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="in_progress")
@@ -90,7 +95,7 @@ class Call(Base):
     detected_language: Mapped[str | None] = mapped_column(String(20), nullable=True)
     outcome: Mapped[str | None] = mapped_column(String(64), nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     business: Mapped[Business] = relationship(back_populates="calls")
     messages: Mapped[list["CallMessage"]] = relationship(
@@ -109,7 +114,7 @@ class CallMessage(Base):
     call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False)  # user | assistant | tool
     text: Mapped[str] = mapped_column(Text, nullable=False)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     call: Mapped[Call] = relationship(back_populates="messages")
 
@@ -147,7 +152,7 @@ class Appointment(Base):
     service: Mapped[str] = mapped_column(String(100), nullable=False)
     doctor: Mapped[str | None] = mapped_column(String(100), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="confirmed")  # confirmed | cancelled
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     business: Mapped[Business] = relationship(back_populates="appointments")
     customer: Mapped[Customer] = relationship(back_populates="appointments")
@@ -171,6 +176,25 @@ class CallExtraction(Base):
     requires_followup: Mapped[bool] = mapped_column(Boolean, default=False)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     structured_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     call: Mapped[Call] = relationship(back_populates="extraction")
+
+
+class Escalation(Base):
+    """A request for a human to call the caller back, raised by the agent when
+    it can't or shouldn't handle something itself (emergency, complaint,
+    question outside its knowledge, or the caller simply asks for a person)."""
+
+    __tablename__ = "escalations"
+    __table_args__ = (Index("ix_escalations_business_status", "business_id", "status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    business_id: Mapped[str] = mapped_column(ForeignKey("businesses.id"), nullable=False)
+    call_id: Mapped[str | None] = mapped_column(ForeignKey("calls.id"), nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    customer_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    urgent: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(32), default="open")  # open | resolved
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

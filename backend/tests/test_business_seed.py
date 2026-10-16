@@ -1,5 +1,6 @@
 from datetime import date, timedelta
 
+from app.business.clock import business_today
 from app.database.database import session_scope
 from app.database.models import AppointmentSlot, Business
 from app.database.seed import AVAILABILITY_DAYS, DOCTORS
@@ -29,7 +30,7 @@ def test_sharma_dental_seeded(business_id):
 
 
 def test_availability_generated_relative_to_today(business_id):
-    today = date.today()
+    today = business_today(None)
     with session_scope() as session:
         count = (
             session.query(AppointmentSlot)
@@ -53,7 +54,7 @@ def test_availability_generated_relative_to_today(business_id):
 
 
 def test_sunday_has_no_slots(business_id):
-    today = date.today()
+    today = business_today(None)
     sunday = next(
         today + timedelta(days=i)
         for i in range(AVAILABILITY_DAYS)
@@ -79,7 +80,7 @@ def test_ensure_availability_tops_up_expired_window_without_touching_bookings(bu
     from app.database.seed import AVAILABILITY_DAYS, ensure_availability
 
     # Simulate a seed that has aged: the last few days of the window have no slots.
-    tail = [(date.today() + timedelta(days=d)).isoformat() for d in range(AVAILABILITY_DAYS - 3, AVAILABILITY_DAYS)]
+    tail = [(business_today(None) + timedelta(days=d)).isoformat() for d in range(AVAILABILITY_DAYS - 3, AVAILABILITY_DAYS)]
     with session_scope() as session:
         session.query(AppointmentSlot).filter(
             AppointmentSlot.business_id == business_id, AppointmentSlot.date.in_(tail)

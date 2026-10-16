@@ -26,6 +26,7 @@ from app.database.models import (
     Call,
     CallExtraction,
     CallMessage,
+    Escalation,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,19 @@ class ExtractionOut(BaseModel):
     summary: str | None
 
 
+class EscalationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    call_id: str | None
+    reason: str
+    customer_name: str | None
+    customer_phone: str | None
+    urgent: bool
+    status: str
+    created_at: datetime
+
+
 class AppointmentOut(BaseModel):
     id: str
     customer_name: str
@@ -133,7 +147,7 @@ def create_token(payload: TokenRequest, settings: Settings = Depends(get_setting
             status_code=503,
             detail=(
                 "LiveKit credentials are not configured. "
-                "Add LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET to backend/.env."
+                "Add LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET to .env in the repo root."
             ),
         )
 
@@ -216,3 +230,16 @@ def list_appointments(
         )
         for a in appointments
     ]
+
+
+@router.get("/escalations", response_model=list[EscalationOut])
+def list_escalations(
+    business_id: str | None = None, status: str | None = "open", limit: int = 50, db: Session = Depends(get_db)
+) -> list[Escalation]:
+    """Callback requests the agent raised for staff, newest first."""
+    query = select(Escalation).order_by(Escalation.created_at.desc()).limit(limit)
+    if business_id:
+        query = query.where(Escalation.business_id == business_id)
+    if status:
+        query = query.where(Escalation.status == status)
+    return list(db.execute(query).scalars().all())

@@ -16,7 +16,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.database.database import session_scope
-from app.database.models import Call, CallExtraction as CallExtractionRow, CallMessage
+from app.database.models import Call, CallExtraction as CallExtractionRow, CallMessage, Escalation
 from app.llm.provider import get_llm_provider
 from app.postcall.schemas import CallExtraction
 
@@ -96,7 +96,11 @@ def _store_extraction(call_id: str, extraction: CallExtraction) -> None:
         existing.appointment_date = extraction.appointment_date
         existing.appointment_time = extraction.appointment_time
         existing.outcome = extraction.outcome
-        existing.requires_followup = extraction.requires_followup
+        # A callback the agent actually raised is a fact, not an LLM judgement.
+        escalated = session.execute(
+            select(Escalation.id).where(Escalation.call_id == call_id).limit(1)
+        ).first() is not None
+        existing.requires_followup = extraction.requires_followup or escalated
         existing.summary = extraction.summary
         existing.structured_json = extraction.model_dump()
 

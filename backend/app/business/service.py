@@ -1,57 +1,14 @@
-"""Business knowledge access.
-
-`KnowledgeProvider` is the seam that lets V0's hardcoded/SQLite-backed business
-knowledge be swapped later for a RAG-based `VectorKnowledgeProvider` without
-touching the agent code that consumes it -- callers only ever ask for
-`get_context()` / `get_business()`.
-"""
+"""Business knowledge for the system prompt: the seeded business row rendered
+as text. A retrieval-based source would replace `render_business_knowledge`
+once a business has more knowledge than fits comfortably in the prompt."""
 
 from __future__ import annotations
-
-from abc import ABC, abstractmethod
-
-from sqlalchemy.orm import Session
 
 from app.database.models import Business
 
 
 class BusinessNotFoundError(Exception):
     pass
-
-
-class KnowledgeProvider(ABC):
-    """Abstract source of business knowledge for the agent's system context.
-
-    V0 implementation: `DatabaseKnowledgeProvider` (reads the seeded SQLite row).
-    Future implementation: a `VectorKnowledgeProvider` doing RAG retrieval over
-    uploaded documents/websites, selecting only the relevant knowledge chunks
-    for a given user turn instead of dumping the whole business record.
-    """
-
-    @abstractmethod
-    async def get_business(self, business_id: str) -> Business: ...
-
-    @abstractmethod
-    async def get_context(self, business_id: str) -> str:
-        """Return a text block suitable for injection into the agent's system prompt."""
-        ...
-
-
-class DatabaseKnowledgeProvider(KnowledgeProvider):
-    """V0: loads the full business record from SQLite and renders it as text."""
-
-    def __init__(self, session: Session):
-        self._session = session
-
-    async def get_business(self, business_id: str) -> Business:
-        business = self._session.get(Business, business_id)
-        if business is None:
-            raise BusinessNotFoundError(f"No business with id={business_id!r}")
-        return business
-
-    async def get_context(self, business_id: str) -> str:
-        business = await self.get_business(business_id)
-        return render_business_knowledge(business)
 
 
 def render_business_knowledge(business: Business) -> str:

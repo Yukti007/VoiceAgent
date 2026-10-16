@@ -2,8 +2,9 @@
 
 Pipeline: browser mic -> LiveKit -> Sarvam Saaras realtime STT -> this Agent's
 LLM (provider-abstracted, OpenAI by default) -> Sarvam Bulbul streaming TTS ->
-LiveKit -> browser speaker. Turn detection/interruption/barge-in is handled by
-AgentSession itself (VAD-based here) -- this file does not reinvent any of that.
+LiveKit -> browser speaker. Turn detection (LiveKit's audio end-of-turn model on
+top of Silero VAD) and barge-in are handled by AgentSession, configured in
+`_build_turn_handling` -- this file does not reinvent any of that.
 
 Run with:
     python -m app.agent.agent dev
@@ -12,9 +13,12 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import sys
-from collections.abc import AsyncIterable, AsyncIterator
+import time
+from collections.abc import AsyncIterable, AsyncIterator, Callable
+from typing import TypeVar
 
 from dotenv import load_dotenv
 
@@ -38,15 +42,16 @@ from livekit.agents import (  # noqa: E402
     APIConnectOptions,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
     ModelSettings,
     RunContext,
+    ToolError,
     WorkerOptions,
     cli,
     function_tool,
     room_io,
 )
-from livekit.agents import inference  # noqa: E402
+from livekit.agents import inference, tokenize  # noqa: E402
+from livekit.agents.tokenize import _basic_sent, token_stream  # noqa: E402
 from livekit.agents.voice.agent_session import SessionConnectOptions  # noqa: E402
 from livekit.plugins import noise_cancellation, sarvam, silero  # noqa: E402
 
@@ -67,6 +72,7 @@ AUDIO_SAMPLE_RATE_IN = 16000
 AUDIO_SAMPLE_RATE_OUT = 24000
 
 from app.agent import audio_cache  # noqa: E402
+from app.agent.latency import LatencyRecorder  # noqa: E402
 from app.agent import session as call_session  # noqa: E402
 from app.agent.prompts import build_system_prompt  # noqa: E402
 from app.agent.state import SessionData  # noqa: E402
@@ -75,6 +81,7 @@ from app.database.seed import ensure_availability  # noqa: E402
 from app.llm.provider import get_agent_llm_with_fallback  # noqa: E402
 from app.postcall.extractor import run_post_call_extraction  # noqa: E402
 from app.tools import appointments as appointment_tools  # noqa: E402
+from app.tools import escalation as escalation_tools  # noqa: E402
 
 logger = logging.getLogger("voice_agent.worker")
 
@@ -102,8 +109,62 @@ SESSION_CONN_OPTIONS = SessionConnectOptions(
 )
 
 
+T = TypeVar("T")
+
+
+async def _run_db_tool(name: str, work: Callable[[], T], latency: LatencyRecorder | None = None) -> T:
+    """Run a tool's synchronous DB work off the event loop.
+
+    Each tool's work is one `session_scope` transaction, so an exception means
+    it was rolled back: nothing half-written. Say exactly that to the LLM
+    (a ToolError message reaches it verbatim) instead of a generic failure,
+    so it apologises truthfully rather than guessing whether the booking went
+    through."""
+    started = time.perf_counter()
+    try:
+        return await asyncio.to_thread(work)
+    except Exception as exc:
+        logger.exception("[tool] %s failed", name)
+        raise ToolError(
+            f"{name} hit an internal error and nothing was saved. Apologise, then offer to "
+            "try again or to have a staff member call the caller back."
+        ) from exc
+    finally:
+        if latency is not None:
+            latency.record_tool(name, time.perf_counter() - started)
+
+
+def _start_protected_write(context: RunContext[SessionData]) -> dict | None:
+    """Enter the critical section for a tool that writes a booking.
+
+    Once a write starts, a barge-in must not cancel the speech that confirms
+    it -- otherwise the change is saved but the caller never hears it and may
+    try again. If the caller already talked over this turn, refuse instead:
+    don't change a booking on a turn they interrupted. Returns the refusal
+    result, or None to go ahead."""
+    try:
+        context.disallow_interruptions()
+    except RuntimeError:
+        return {
+            "success": False,
+            "error": "Nothing changed: the caller interrupted. Confirm the details with them again.",
+        }
+    return None
+
+
+def _caller_turns(agent: Agent) -> int:
+    """How many times the caller has spoken so far in this conversation."""
+    return sum(
+        1 for item in agent.chat_ctx.items if getattr(item, "type", None) == "message" and item.role == "user"
+    )
+
+
 # How much of a reply to read before choosing the TTS language for it.
 _TTS_LANGUAGE_PEEK_LETTERS = 12
+
+# Sentence chunking for streaming TTS (framework defaults: 20 / 10 chars).
+_TTS_MIN_SENTENCE_LEN = 8
+_TTS_CONTEXT_LEN = 4
 
 
 def tts_language_for(text: str) -> str | None:
@@ -116,13 +177,51 @@ def tts_language_for(text: str) -> str | None:
     return "hi-IN" if devanagari * 2 >= len(letters) else "en-IN"
 
 
+def _split_sentences_indic(
+    text: str, min_sentence_len: int = 20, retain_format: bool = False
+) -> list[tuple[str, int, int]]:
+    """LiveKit's basic splitter, taught that the Devanagari danda ends a sentence.
+
+    It only knows . ! ? and the CJK full stops, so a Hindi reply ending its
+    sentences with "।" was one unbroken "sentence": TTS got nothing until the
+    LLM had finished the whole reply, and audio trailed the transcript by
+    seconds. Swap danda for "。" (same length, so offsets hold) and back."""
+    swapped = text.replace("।", "。").replace("॥", "。")
+    return [
+        (sentence.replace("。", "।"), start, end)
+        for sentence, start, end in _basic_sent.split_sentences(
+            swapped, min_sentence_len=min_sentence_len, retain_format=retain_format
+        )
+    ]
+
+
+class IndicSentenceTokenizer(tokenize.basic.SentenceTokenizer):
+    """Sentence tokenizer for Bulbul's streaming input: splits on danda too,
+    and flushes short first sentences ("बहुत अच्छा!") instead of holding them
+    back to merge with the next one."""
+
+    def __init__(self) -> None:
+        super().__init__(min_sentence_len=_TTS_MIN_SENTENCE_LEN, stream_context_len=_TTS_CONTEXT_LEN)
+
+    def tokenize(self, text: str, *, language: str | None = None) -> list[str]:
+        return [s for s, _, _ in _split_sentences_indic(text, _TTS_MIN_SENTENCE_LEN)]
+
+    def stream(self, *, language: str | None = None) -> tokenize.SentenceStream:
+        return token_stream.BufferedSentenceStream(
+            tokenizer=functools.partial(_split_sentences_indic, min_sentence_len=_TTS_MIN_SENTENCE_LEN),
+            min_token_len=_TTS_MIN_SENTENCE_LEN,
+            min_ctx_len=_TTS_CONTEXT_LEN,
+        )
+
+
 class Assistant(Agent):
     """Aisha. Business knowledge + tool-use rules live in the system prompt
     (see app/agent/prompts.py + the seeded Business row); this class only
     exposes the deterministic tool implementations."""
 
-    def __init__(self, *, instructions: str) -> None:
+    def __init__(self, *, instructions: str, latency: LatencyRecorder | None = None) -> None:
         super().__init__(instructions=instructions)
+        self.latency = latency
 
     async def tts_node(self, text: AsyncIterable[str], model_settings: ModelSettings):
         """Voice each reply in the language it is written in.
@@ -155,6 +254,34 @@ class Assistant(Agent):
         async for frame in Agent.default.tts_node(self, _replay(), model_settings):
             yield frame
 
+    async def _book_after_read_back(
+        self, context: RunContext[SessionData], name: str, book: Callable[[bool], dict]
+    ) -> dict:
+        """Make reading the booking back to the caller a step the code enforces.
+
+        A live call showed the model booking straight from what STT heard,
+        without confirming -- a misheard phone number becomes a real booking.
+        So the first call is a preview (every check, nothing claimed) that
+        returns the details to read back; the booking commits only when the
+        same details come back on a later caller turn, i.e. after the caller
+        has had a chance to say yes or correct them."""
+        preview = await _run_db_tool(name, lambda: book(True), self.latency)
+        if not preview.get("requires_confirmation"):
+            return preview  # a validation error, or already booked
+        key = preview.pop("confirmation_key")
+        turn = _caller_turns(self)
+        read_back_at = context.userdata.read_backs.setdefault(key, turn)
+        if read_back_at >= turn:
+            return preview
+
+        if (refused := _start_protected_write(context)) is not None:
+            return refused
+        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
+            result = await _run_db_tool(name, lambda: book(False), self.latency)
+        if result.get("success"):
+            context.userdata.read_backs.pop(key, None)
+        return result
+
     @function_tool()
     async def check_availability(
         self,
@@ -177,7 +304,7 @@ class Assistant(Agent):
                 )
 
         async with context.with_filler(AVAILABILITY_FILLER, delay=FILLER_DELAY):
-            result = await asyncio.to_thread(_query)
+            result = await _run_db_tool("check_availability", _query, self.latency)
         logger.info("[tool] check_availability(%s, doctor=%s) -> %s", date, doctor, result)
         return result
 
@@ -192,9 +319,10 @@ class Assistant(Agent):
         service: str,
         doctor: str | None = None,
     ) -> dict:
-        """Book a real appointment at Sharma Dental Care. Only call this after the caller
-        has confirmed name, phone, service, date and time, and after check_availability
-        has shown the slot as open.
+        """Book a real appointment at Sharma Dental Care, after check_availability has
+        shown the slot as open. Works in two steps: the first call returns
+        requires_confirmation with the details to read back; once the caller confirms
+        them, call again with exactly the same details to book.
 
         Args:
             customer_name: Caller's full name.
@@ -204,22 +332,9 @@ class Assistant(Agent):
             service: Service being booked, e.g. "Consultation" or "Teeth whitening".
             doctor: Optional preferred doctor's name.
         """
-        # Critical section: once the booking is being written, a barge-in must
-        # not cancel the speech that confirms it -- otherwise the slot is
-        # booked but the caller never hears it and may try to book again.
-        try:
-            context.disallow_interruptions()
-        except RuntimeError:
-            # The caller already interrupted before we started; don't book on
-            # a turn they talked over.
-            return {
-                "success": False,
-                "error": "Not booked: the caller interrupted. Confirm the details with them again.",
-            }
-
         business_id = context.userdata.business_id
 
-        def _book() -> dict:
+        def _book(preview: bool) -> dict:
             with session_scope() as session:
                 return appointment_tools.book_appointment(
                     session,
@@ -230,10 +345,10 @@ class Assistant(Agent):
                     time=time,
                     service=service,
                     doctor=doctor,
+                    preview=preview,
                 )
 
-        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
-            result = await asyncio.to_thread(_book)
+        result = await self._book_after_read_back(context, "book_appointment", _book)
         logger.info("[tool] book_appointment(%s) -> %s", customer_name, result)
         return result
 
@@ -249,7 +364,8 @@ class Assistant(Agent):
     ) -> dict:
         """Book the same date and time for several people at once, e.g. a caller and
         their child. Use instead of book_appointment whenever more than one person
-        needs an appointment. Books everyone or no one.
+        needs an appointment. Books everyone or no one. Two steps, like book_appointment:
+        read back the returned details, then call again with the same details.
 
         Args:
             patient_names: Full name of each person to book, including the caller if
@@ -257,19 +373,11 @@ class Assistant(Agent):
             customer_phone: Contact phone number shared by the group.
             date: ISO date YYYY-MM-DD.
             time: 24-hour time HH:MM.
-            service: Service being booked, e.g. "Teeth cleaning".
+            service: Service being booked, e.g. "Dental cleaning".
         """
-        try:
-            context.disallow_interruptions()
-        except RuntimeError:
-            return {
-                "success": False,
-                "error": "Not booked: the caller interrupted. Confirm the details with them again.",
-            }
-
         business_id = context.userdata.business_id
 
-        def _book() -> dict:
+        def _book(preview: bool) -> dict:
             with session_scope() as session:
                 return appointment_tools.book_group_appointment(
                     session,
@@ -279,11 +387,152 @@ class Assistant(Agent):
                     date=date,
                     time=time,
                     service=service,
+                    preview=preview,
+                )
+
+        result = await self._book_after_read_back(context, "book_group_appointment", _book)
+        logger.info("[tool] book_group_appointment(%s) -> %s", patient_names, result)
+        return result
+
+    @function_tool()
+    async def find_appointments(self, context: RunContext[SessionData], customer_phone: str) -> dict:
+        """List the caller's upcoming appointments (everyone booked on their phone number).
+        Call this before cancelling or rescheduling, to get the appointment_id.
+
+        Args:
+            customer_phone: The phone number the appointment was booked with.
+        """
+        business_id = context.userdata.business_id
+
+        def _query() -> dict:
+            with session_scope() as session:
+                return appointment_tools.find_appointments(
+                    session, business_id=business_id, customer_phone=customer_phone
+                )
+
+        result = await _run_db_tool("find_appointments", _query, self.latency)
+        logger.info("[tool] find_appointments -> %d found", len(result.get("appointments", [])))
+        return result
+
+    @function_tool()
+    async def cancel_appointment(
+        self,
+        context: RunContext[SessionData],
+        appointment_id: str,
+        customer_phone: str,
+        accept_late_policy: bool = False,
+    ) -> dict:
+        """Cancel one of the caller's appointments and free its slot. Only call after the
+        caller has confirmed which appointment (date and time) to cancel.
+
+        Args:
+            appointment_id: From find_appointments. Never read it aloud.
+            customer_phone: The phone number the appointment was booked with.
+            accept_late_policy: Set true only after the caller has heard the late-change
+                policy (returned as requires_confirmation) and still wants to cancel.
+        """
+        if (refused := _start_protected_write(context)) is not None:
+            return refused
+        business_id = context.userdata.business_id
+
+        def _cancel() -> dict:
+            with session_scope() as session:
+                return appointment_tools.cancel_appointment(
+                    session,
+                    business_id=business_id,
+                    appointment_id=appointment_id,
+                    customer_phone=customer_phone,
+                    accept_late_policy=accept_late_policy,
                 )
 
         async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
-            result = await asyncio.to_thread(_book)
-        logger.info("[tool] book_group_appointment(%s) -> %s", patient_names, result)
+            result = await _run_db_tool("cancel_appointment", _cancel, self.latency)
+        logger.info("[tool] cancel_appointment -> success=%s", result.get("success"))
+        return result
+
+    @function_tool()
+    async def reschedule_appointment(
+        self,
+        context: RunContext[SessionData],
+        appointment_id: str,
+        customer_phone: str,
+        new_date: str,
+        new_time: str,
+        doctor: str | None = None,
+        accept_late_policy: bool = False,
+    ) -> dict:
+        """Move one of the caller's appointments to a new date and time. Use this, never
+        book_appointment, when the caller wants to change an existing booking: it frees the
+        old slot in the same step. Check availability for the new date first.
+
+        Args:
+            appointment_id: From find_appointments. Never read it aloud.
+            customer_phone: The phone number the appointment was booked with.
+            new_date: ISO date YYYY-MM-DD.
+            new_time: 24-hour time HH:MM.
+            doctor: Optional, only if the caller wants a different doctor.
+            accept_late_policy: Set true only after the caller has heard the late-change
+                policy (returned as requires_confirmation) and still wants to reschedule.
+        """
+        if (refused := _start_protected_write(context)) is not None:
+            return refused
+        business_id = context.userdata.business_id
+
+        def _reschedule() -> dict:
+            with session_scope() as session:
+                return appointment_tools.reschedule_appointment(
+                    session,
+                    business_id=business_id,
+                    appointment_id=appointment_id,
+                    customer_phone=customer_phone,
+                    new_date=new_date,
+                    new_time=new_time,
+                    doctor=doctor,
+                    accept_late_policy=accept_late_policy,
+                )
+
+        async with context.with_filler(BOOKING_FILLER, delay=FILLER_DELAY):
+            result = await _run_db_tool("reschedule_appointment", _reschedule, self.latency)
+        logger.info("[tool] reschedule_appointment(%s %s) -> success=%s", new_date, new_time, result.get("success"))
+        return result
+
+    @function_tool()
+    async def request_human_callback(
+        self,
+        context: RunContext[SessionData],
+        reason: str,
+        customer_phone: str | None = None,
+        customer_name: str | None = None,
+        urgent: bool = False,
+    ) -> dict:
+        """Ask a staff member to call the caller back. Use when the caller asks for a person,
+        has a complaint or billing question, describes a dental emergency (after telling them
+        to seek urgent care), asks something your business knowledge does not cover, or a
+        tool keeps failing. Do not promise a specific callback time.
+
+        Args:
+            reason: One short sentence a staff member can act on.
+            customer_phone: Number to call back on, if the caller gives one.
+            customer_name: Caller's name, if known.
+            urgent: True for emergencies or a caller in pain.
+        """
+        business_id = context.userdata.business_id
+        call_id = context.userdata.call_id
+
+        def _escalate() -> dict:
+            with session_scope() as session:
+                return escalation_tools.request_human_callback(
+                    session,
+                    business_id=business_id,
+                    call_id=call_id,
+                    reason=reason,
+                    customer_phone=customer_phone,
+                    customer_name=customer_name,
+                    urgent=urgent,
+                )
+
+        result = await _run_db_tool("request_human_callback", _escalate, self.latency)
+        logger.info("[tool] request_human_callback(urgent=%s) -> success=%s", urgent, result.get("success"))
         return result
 
     @function_tool()
@@ -302,7 +551,7 @@ class Assistant(Agent):
                 business = session.get(Business, business_id)
                 return appointment_tools.get_business_hours(business, day)
 
-        result = await asyncio.to_thread(_query)
+        result = await _run_db_tool("get_business_hours", _query, self.latency)
         logger.info("[tool] get_business_hours(day=%s) -> %s", day, result)
         return result
 
@@ -320,7 +569,7 @@ class Assistant(Agent):
                 business = session.get(Business, business_id)
                 return appointment_tools.get_service_price(business, service)
 
-        result = await asyncio.to_thread(_query)
+        result = await _run_db_tool("get_service_price", _query, self.latency)
         logger.info("[tool] get_service_price(%s) -> %s", service, result)
         return result or {"error": f"No pricing information found for '{service}'."}
 
@@ -465,57 +714,35 @@ async def entrypoint(ctx: JobContext) -> None:
 
     call_id = await asyncio.to_thread(call_session.create_call, business_id, ctx.room.name)
     message_writer = call_session.CallMessageWriter(call_id)
+    latency = LatencyRecorder(call_id)
     logger.info("[call %s] starting session for room=%s agent=%s", call_id, ctx.room.name, agent_name)
+
+    tts = sarvam.TTS(
+        api_key=settings.sarvam_api_key,
+        target_language_code=settings.sarvam_tts_language,
+        speaker=settings.sarvam_tts_speaker,
+        speech_sample_rate=AUDIO_SAMPLE_RATE_OUT,
+    )
+    # The plugin's constructor doesn't take a tokenizer; see IndicSentenceTokenizer.
+    tts._opts.word_tokenizer = IndicSentenceTokenizer()
 
     session: AgentSession[SessionData] = AgentSession[SessionData](
         userdata=SessionData(business_id=business_id, call_id=call_id, room_name=ctx.room.name),
         stt=sarvam.STTRealtime(
             api_key=settings.sarvam_api_key,
-            # `language` was previously pinned to a fixed BCP-47 code (hi-IN), which
-            # doesn't just set a *default* -- it forces Sarvam to decode every
-            # utterance through that language's model. A pinned "hi-IN" was
-            # confirmed live to mis-transcribe/drop words in English speech (being
-            # decoded through a Hindi acoustic/language model) and to report every
-            # utterance's language as "hi" regardless of what was actually said --
-            # which then fed a Hindi (or garbled) transcript to the LLM, whose
-            # "reply in the caller's language" instruction faithfully mirrored that
-            # mistake back in Hindi even when the caller spoke English. `"auto"` is
-            # a first-class value here (see livekit-plugins-sarvam's
-            # RealtimeSTTOptions.language / SUPPORTED_LANGUAGES) that runs Sarvam's
-            # own per-utterance language identification instead, so English and
-            # Hindi/Hinglish speech are each decoded through their own model and
-            # `ev.language` on user_input_transcribed reports what was actually
-            # detected -- which is also what the TTS-retargeting handler below
-            # already relies on.
+            # "auto" runs Sarvam's per-utterance language ID. Pinning hi-IN pushed
+            # English speech through the Hindi model and garbled it.
             language=settings.sarvam_stt_language,
-            # "codemix" was separately confirmed to render pure-English utterances
-            # as Devanagari-script phonetic transliteration (e.g. "Hi Aisha, how are
-            # you?" -> "हाय आयशा, हाउ आर यू?") even independent of the language-pin
-            # issue above. "transcribe" is standard transcription in the language
-            # actually spoken/detected, which is what we want; "codemix" is for
-            # genuinely mixed Hindi/English *within one utterance*, not a wholesale
-            # script choice.
+            # "codemix" transliterated plain English into Devanagari; "transcribe"
+            # keeps each utterance in the script it was spoken in.
             mode="transcribe",
             sample_rate=AUDIO_SAMPLE_RATE_IN,
             prompt=stt_vocabulary_hint,
         ),
         llm=get_agent_llm_with_fallback(settings),
-        tts=sarvam.TTS(
-            api_key=settings.sarvam_api_key,
-            target_language_code=settings.sarvam_tts_language,
-            speaker=settings.sarvam_tts_speaker,
-            speech_sample_rate=AUDIO_SAMPLE_RATE_OUT,
-        ),
-        # `vad` still gates raw speech/silence framing (and is required by the STT/TTS
-        # provider interfaces below), but deliberately NOT passed as `turn_detection`:
-        # livekit-agents 1.8's default turn detector is a semantic end-of-turn model
-        # (inference.TurnDetector, per-language thresholds incl. "hi") that judges
-        # whether a pause is really turn-final instead of just timing raw silence.
-        # Forcing turn_detection="vad" (the previous config) disables that model and
-        # falls back to a fixed silence timeout -- worse latency on confident turn
-        # ends AND more false interruptions on mid-sentence pauses, which are exactly
-        # this demo's two headline risks for Hindi/Hinglish speech. Leaving
-        # `turn_detection` unset lets AgentSession pick that smart default.
+        tts=tts,
+        # VAD frames raw speech/silence; whether a pause actually ends the turn is
+        # decided by the turn detector in `turn_handling` (see _build_turn_handling).
         vad=ctx.proc.userdata["vad"],
         turn_handling=_build_turn_handling(settings),
         conn_options=SESSION_CONN_OPTIONS,
@@ -538,24 +765,9 @@ async def entrypoint(ctx: JobContext) -> None:
         if role in ("user", "assistant") and text:
             message_writer.enqueue(role, text)
             logger.info("[call %s] %s: %s", call_id, role, text)
-
-    @session.on("metrics_collected")
-    def _on_metrics(ev: MetricsCollectedEvent) -> None:
-        m = ev.metrics
-        kind = getattr(m, "type", "unknown")
-        if kind == "stt_metrics":
-            logger.info("[call %s] latency stt duration=%.3fs", call_id, m.duration)
-        elif kind == "llm_metrics":
-            logger.info("[call %s] latency llm ttft=%.3fs duration=%.3fs", call_id, m.ttft, m.duration)
-        elif kind == "tts_metrics":
-            logger.info("[call %s] latency tts ttfb=%.3fs duration=%.3fs", call_id, m.ttfb, m.duration)
-        elif kind == "eou_metrics":
-            logger.info(
-                "[call %s] latency end-of-turn delay=%.3fs transcription_delay=%.3fs",
-                call_id,
-                m.end_of_utterance_delay,
-                m.transcription_delay,
-            )
+        # Per-turn latency, measured by LiveKit itself (see app/agent/latency.py).
+        for row in latency.record_turn(getattr(item, "metrics", None)):
+            logger.info("[call %s] latency %s=%.3fs", call_id, row["stage"], row["seconds"])
 
     @session.on("agent_state_changed")
     def _on_agent_state(ev) -> None:
@@ -602,6 +814,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # Flush pending transcript writes before closing the call out, so the
         # post-call extraction sees the complete transcript.
         await message_writer.aclose()
+        await latency.aflush()
         await asyncio.to_thread(call_session.end_call, call_id, call_status["value"])
         try:
             await run_post_call_extraction(call_id)
@@ -611,7 +824,7 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(_on_shutdown)
 
     await session.start(
-        agent=Assistant(instructions=instructions),
+        agent=Assistant(instructions=instructions, latency=latency),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
